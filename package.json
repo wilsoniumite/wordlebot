@@ -1,0 +1,35 @@
+{
+  "name": "wordlebot",
+  "version": "0.1.0",
+  "description": "A discord bot that reads wordle activity data and generates leaderboards and statistics. ",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js",
+    "register": "node registerCommands.js",
+    "dev": "nodemon app.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wilsontomass/wordlebot.git"
+  },
+  "author": "Tomass Wilson",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Wilsontomass/wordlebot/issues"
+  },
+  "homepage": "https://github.com/Wilsontomass/wordlebot#readme",
+  "dependencies": {
+    "discord-interactions": "^4.3.0",
+    "discord.js": "^14.22.1",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.16.3",
+    "sharp": "^0.34.4",
+    "tesseract.js": "^6.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}

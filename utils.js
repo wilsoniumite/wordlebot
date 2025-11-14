@@ -317,7 +317,6 @@ async function buildUsernameMapping(guildId) {
     await handleRateLimitHeaders(response, 'buildUsernameMapping');
     
     const members = await response.json();
-    console.log(`Building username mapping for ${members.length} guild members...`);
     
     for (const member of members) {
       if (member.user.bot) continue; // Skip bots
@@ -328,30 +327,22 @@ async function buildUsernameMapping(guildId) {
       
       // Store lowercase for case-insensitive matching
       usernameToUserId[displayName.toLowerCase()] = userId;
-      
-      console.log(`  Mapped: "${displayName}" → ${userId}`);
     }
-    
-    console.log(`Built mapping for ${Object.keys(usernameToUserId).length} users`);
   } catch (error) {
     console.error('Error building username mapping:', error);
   }
-  console.log(usernameToUserId)
-  
   return { usernameToUserId };
 }
 
 // Extract Wordle number from image using OCR
 async function extractWordleNumber(imageUrl) {
   try {
-    console.log(`  Extracting Wordle number from image: ${imageUrl}`);
     
     // Fetch the image
     const response = await fetch(imageUrl);
     const buffer = await response.arrayBuffer();
     
     // Crop to just the top portion with "Wordle No. 1567"
-    // This makes OCR faster and more accurate
     const cropped = await sharp(Buffer.from(buffer))
       .extract({
         left: 141,    // x position
@@ -371,7 +362,6 @@ async function extractWordleNumber(imageUrl) {
     
     if (match) {
       const wordleNumber = parseInt(match[1]);
-      console.log(`  ✓ Found Wordle #${wordleNumber}`);
       return wordleNumber;
     }
     
@@ -406,8 +396,6 @@ export async function parseWordleResults(messages, guildId) {
       
       const lines = message.content.split('\n').slice(1);
       const dayResults = [];
-      console.log(wordleNumber)
-      console.log(message.content)
       
       for (const line of lines) {
         if (!line.includes(':')) continue;
@@ -457,12 +445,9 @@ export async function parseWordleResults(messages, guildId) {
       
       if (dayResults.length > 0) {
         scores[wordleNumber] = dayResults;
-        console.log(`  Parsed Wordle #${wordleNumber}: ${dayResults.length} results`);
       }
     }
   }
-  console.log(scores)
-  
   return scores;
 }
 

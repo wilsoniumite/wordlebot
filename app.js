@@ -26,10 +26,58 @@ import {
   hashUserId
 } from './db.js';
 
-// Create an express app
+const UMAMI_URL = process.env.UMAMI_URL;
+const UMAMI_WEBSITE_ID = process.env.UMAMI_WEBSITE_ID;
+
+
 const app = express();
-// Get port, or default to 3000
 const PORT = process.env.PORT || 3000;
+
+async function trackEvent(event, data = {}) {
+  if (!UMAMI_URL || !UMAMI_WEBSITE_ID) return;
+  
+  try {
+    const response = await fetch(`${UMAMI_URL}/api/send`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      body: JSON.stringify({
+        payload: {
+          hostname: 'discord-bot',
+          language: 'en-US',
+          referrer: '',
+          screen: '1920x1080',
+          title: event,
+          url: `/interactions/${event}`,
+          website: UMAMI_WEBSITE_ID,
+          name: event,
+          data: data
+        },
+        type: 'event'
+      })
+    });
+  } catch (err) {
+    console.error('Umami tracking error:', err.message);
+  }
+}
+
+app.use('/interactions', (req, res, next) => {
+  let tracked = false;
+  
+  res.on('finish', () => {
+    if (!tracked && req.body?.data?.name) {
+      tracked = true;
+      trackEvent(req.body.data.name, {
+        guild: req.body?.guild_id,
+        user: req.body?.member?.user?.id || req.body?.user?.id
+      });
+    }
+  });
+  
+  next();
+});
 
 app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async function (req, res) {
   const { id, type, data } = req.body;
@@ -100,7 +148,6 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         // Save to database
         console.log('[Sync] Saving results to database...');
         const saveResult = await saveWordleResults(channelScores);
-        console.log(`[Sync] Saved ${saveResult.total} results (${saveResult.new} new, ${saveResult.updated} updated)`);
         
         // Send success message (ephemeral)
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {

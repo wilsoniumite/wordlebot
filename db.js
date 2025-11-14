@@ -236,7 +236,6 @@ export async function getUserStats(userId) {
   }
 }
 
-// Close the pool (call when shutting down)
 export async function closePool() {
   await pool.end();
 }

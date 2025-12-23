@@ -682,24 +682,172 @@ export function calculateLeaderboard(scores, options) {
   }
 }
 
-// Format leaderboard for Discord
-export function formatLeaderboard(leaderboard, statsMethod) {
+// SVG Generation
+const COLORS = {
+  background: '#2b2d31',
+  tableBackground: '#313338',
+  headerBackground: '#5865f2',
+  oddRow: '#2b2d31',
+  evenRow: '#313338',
+  white: '#fff',
+  gray: '#b9bbbe',
+  green: '#00d4aa',
+  gold: '#ffd700',
+  silver: '#c0c0c0',
+  bronze: '#cd7f32'
+};
+
+function escapeXml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function getRankColor(rank) {
+  if (rank === 1) return COLORS.gold;
+  if (rank === 2) return COLORS.silver;
+  if (rank === 3) return COLORS.bronze;
+  return COLORS.gray;
+}
+
+function getRowColor(index) {
+  return index % 2 === 0 ? COLORS.oddRow : COLORS.evenRow;
+}
+
+function wrapText(text, maxChars) {
+  if (text.length <= maxChars) {
+    return [text];
+  }
+  
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+  
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    if (testLine.length <= maxChars) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) {
+        lines.push(currentLine);
+      }
+      currentLine = word;
+    }
+  }
+  
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+  
+  return lines;
+}
+
+export function generateLeaderboardSVG(leaderboard, statsMethod, dataSource = '') {
   const isElo = statsMethod === 'Elo';
-  const title = isElo ? '🏆 Elo Leaderboard' : '📊 Average Score Leaderboard';
+  const data = leaderboard.map((entry, idx) => ({
+    rank: idx + 1,
+    player: entry.player,
+    elo: entry.rating.toFixed(2),
+    games: entry.numGames
+  }));
   
-  let result = `${title}\n\`\`\`\n`;
-  result += `Rank  Player                ${isElo ? 'Elo' : 'Avg'}    Games\n`;
-  result += `────  ──────────────────  ──────  ─────\n`;
+  const width = 460;
+  const padding = 10;
+  const tableWidth = 440;
+  const headerHeight = 32;
+  const baseRowHeight = 28;
+  const titleHeight = 40;
+  const maxPlayerNameChars = 28;
   
-  leaderboard.forEach((entry, idx) => {
-    const rank = (idx + 1).toString().padStart(4);
-    const player = entry.player.padEnd(18);
-    const rating = entry.rating.toFixed(2).padStart(6);
-    const games = entry.numGames.toString().padStart(5);
-    
-    result += `${rank}  ${player}  ${rating}  ${games}\n`;
+  // Pre-calculate row heights based on text wrapping
+  const rowHeights = data.map(row => {
+    const lines = wrapText(row.player, maxPlayerNameChars);
+    return Math.max(baseRowHeight, lines.length * 18 + 10);
   });
   
-  result += '```';
-  return result;
+  const tableHeight = headerHeight + rowHeights.reduce((sum, h) => sum + h, 0);
+  const totalHeight = padding * 2 + titleHeight + tableHeight;
+
+  const ratingLabel = isElo ? 'ELO' : 'AVG';
+  const title = isElo ? 'Elo Leaderboard' : 'Average Score Leaderboard';
+
+  let svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${totalHeight}" viewBox="0 0 ${width} ${totalHeight}">
+  <defs>
+    <style>
+      .title { font: 600 24px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: ${COLORS.white}; }
+      .header { font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: ${COLORS.white}; text-transform: uppercase; letter-spacing: 0.5px; }
+      .rank-text { font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+      .player-text { font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: ${COLORS.white}; }
+      .elo-text { font: 500 15px 'Courier New', monospace; fill: ${COLORS.green}; }
+      .games-text { font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: ${COLORS.gray}; }
+    </style>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="${width}" height="${totalHeight}" fill="${COLORS.background}"/>
+  
+  <!-- Title -->
+  <text x="${padding}" y="${padding + 24}" class="title">${escapeXml(title)}</text>
+  
+  <!-- Table background with rounded corners -->
+  <rect x="${padding}" y="${padding + titleHeight}" width="${tableWidth}" height="${tableHeight}" rx="8" fill="${COLORS.tableBackground}"/>
+  
+  <!-- Header background -->
+  <rect x="${padding}" y="${padding + titleHeight}" width="${tableWidth}" height="${headerHeight}" rx="8" fill="${COLORS.headerBackground}"/>
+  <rect x="${padding}" y="${padding + titleHeight + 8}" width="${tableWidth}" height="${headerHeight - 8}" fill="${COLORS.headerBackground}"/>
+  
+  <!-- Header text -->
+  <text x="${padding + 8}" y="${padding + titleHeight + 21}" class="header"></text>
+  <text x="${padding + 40}" y="${padding + titleHeight + 21}" class="header">PLAYER</text>
+  <text x="${padding + 280}" y="${padding + titleHeight + 21}" class="header">${ratingLabel}</text>
+  <text x="${padding + 380}" y="${padding + titleHeight + 21}" class="header">GAMES</text>
+`;
+
+  // Generate rows
+  let currentY = padding + titleHeight + headerHeight;
+  
+  data.forEach((row, index) => {
+    const y = currentY;
+    const rowHeight = rowHeights[index];
+    const rowColor = getRowColor(index);
+    const rankColor = getRankColor(row.rank);
+    
+    // Row background
+    svg += `  <rect x="${padding}" y="${y}" width="${tableWidth}" height="${rowHeight}" fill="${rowColor}"/>\n`;
+    
+    // Calculate vertical center for single-line content
+    const singleLineY = y + (rowHeight / 2) + 5;
+    
+    // Rank (vertically centered)
+    svg += `  <text x="${padding + 8}" y="${singleLineY}" class="rank-text" fill="${rankColor}">${row.rank}</text>\n`;
+    
+    // Player name (with wrapping, vertically centered)
+    const nameLines = wrapText(row.player, maxPlayerNameChars);
+    if (nameLines.length === 1) {
+      svg += `  <text x="${padding + 40}" y="${singleLineY}" class="player-text">${escapeXml(row.player)}</text>\n`;
+    } else {
+      const textBlockHeight = nameLines.length * 16;
+      const startY = y + (rowHeight - textBlockHeight) / 2 + 12;
+      svg += `  <text x="${padding + 40}" y="${startY}" class="player-text">\n`;
+      nameLines.forEach((line, i) => {
+        svg += `    <tspan x="${padding + 40}" dy="${i === 0 ? 0 : 16}">${escapeXml(line)}</tspan>\n`;
+      });
+      svg += `  </text>\n`;
+    }
+    
+    // Elo (vertically centered)
+    svg += `  <text x="${padding + 280}" y="${singleLineY}" class="elo-text">${row.elo}</text>\n`;
+    
+    // Games (right-aligned, vertically centered)
+    svg += `  <text x="${padding + 425}" y="${singleLineY}" class="games-text" text-anchor="end">${row.games}</text>\n`;
+    
+    currentY += rowHeight;
+  });
+
+  svg += '</svg>';
+  return svg;
 }

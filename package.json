@@ -24,6 +24,7 @@
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
+    "formdata-node": "^6.0.3",
     "node-fetch": "^3.3.2",
     "pg": "^8.16.3",
     "sharp": "^0.34.4",

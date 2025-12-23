@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
+import { FormData, File } from 'formdata-node';
+import sharp from 'sharp';
 import {
   ButtonStyleTypes,
   InteractionResponseFlags,
@@ -14,7 +16,7 @@ import {
   fetchChannelMessages,
   parseWordleResults,
   calculateLeaderboard,
-  formatLeaderboard,
+  generateLeaderboardSVG,
   fetchUserInfo,
   filterScores
 } from './utils.js';
@@ -381,21 +383,37 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           player: userIdToUsername[entry.player] || entry.player
         }));
         
+        // Generate SVG
+        console.log('Generating SVG leaderboard...');
         const dataSource = channelOnly ? ' (Channel Only)' : ' (All Channels)';
-        const formattedLeaderboard = formatLeaderboard(
-          leaderboardWithUsernames, 
-          optionsMap.stats_method || 'Elo', 
-          leaderboardOptions,
+        const svgContent = generateLeaderboardSVG(
+          leaderboardWithUsernames,
+          optionsMap.stats_method || 'Elo',
           dataSource
         );
         
-        // Update the deferred response
+        // Convert SVG to PNG using sharp
+        console.log('Converting SVG to PNG...');
+        const pngBuffer = await sharp(Buffer.from(svgContent))
+          .png()
+          .toBuffer();
+        
+        // Create FormData and attach the PNG
+        const formData = new FormData();
+        
+        // Create a File object from the PNG buffer
+        const pngFile = new File([pngBuffer], 'leaderboard.png', { type: 'image/png' });
+        formData.append('files[0]', pngFile);
+        
+        // Add the message payload
+        formData.append('payload_json', JSON.stringify({
+          content: `📊 Leaderboard${dataSource}`
+        }));
+        
+        // Send to Discord webhook
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            content: formattedLeaderboard
-          })
+          body: formData
         });
         
       } catch (error) {

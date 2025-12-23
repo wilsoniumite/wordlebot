@@ -73,10 +73,10 @@ const SYNC_COMMAND = {
   ]
 };
 
-// Wordle leaderboard command
-const LEADERBOARD_COMMAND = {
-  name: 'leaderboard',
-  description: 'Generate Wordle statistics leaderboard from channel messages',
+// Elo-based leaderboard command
+const ELO_LEADERBOARD_COMMAND = {
+  name: 'elo_leaderboard',
+  description: 'Generate Wordle leaderboard using Elo ratings',
   type: 1,
   integration_types: [0, 1],
   contexts: [0, 1, 2],
@@ -86,22 +86,6 @@ const LEADERBOARD_COMMAND = {
       description: 'Only use data from this channel (default: false, uses all channels)',
       type: 5, // BOOLEAN
       required: false
-    },
-    {
-      name: 'stats_method',
-      description: 'Statistical method to use for rankings',
-      type: 3, // STRING
-      required: false,
-      choices: [
-        {
-          name: 'Elo Rating',
-          value: 'Elo'
-        },
-        {
-          name: 'Average Score',
-          value: 'Average'
-        }
-      ]
     },
     {
       name: 'game_cutoff',
@@ -119,7 +103,7 @@ const LEADERBOARD_COMMAND = {
     },
     {
       name: 'elo_method',
-      description: 'Elo calculation method (only used when stats_method is Elo)',
+      description: 'Elo calculation method (default: Iterated)',
       type: 3, // STRING
       required: false,
       choices: [
@@ -140,22 +124,59 @@ const LEADERBOARD_COMMAND = {
       required: false,
       min_value: 0.1,
       max_value: 30.0
+    }
+  ]
+};
+
+// Average-based leaderboard command
+const AVERAGE_LEADERBOARD_COMMAND = {
+  name: 'average_leaderboard',
+  description: 'Generate Wordle leaderboard using average scores',
+  type: 1,
+  integration_types: [0, 1],
+  contexts: [0, 1, 2],
+  options: [
+    {
+      name: 'channel_only',
+      description: 'Only use data from this channel (default: false, uses all channels)',
+      type: 5, // BOOLEAN
+      required: false
+    },
+    {
+      name: 'game_cutoff',
+      description: 'Minimum number of games played to be included (default: 3)',
+      type: 4, // INTEGER
+      required: false,
+      min_value: 1,
+      max_value: 100
+    },
+    {
+      name: 'x_is_seven',
+      description: 'Count X (failed attempts) as score 7 instead of excluding (default: false)',
+      type: 5, // BOOLEAN
+      required: false
     },
     {
       name: 'day_adjustment',
-      description: 'Adjust scores by day difficulty for Average method (default: true)',
+      description: 'Adjust scores by day difficulty (default: true)',
       type: 5, // BOOLEAN
       required: false
     },
     {
       name: 'bayes_adjustment',
-      description: 'Use Bayesian adjustment for Average method (default: true)',
+      description: 'Use Bayesian adjustment (default: true)',
       type: 5, // BOOLEAN
       required: false
     }
   ]
 };
 
-const ALL_COMMANDS = [TEST_COMMAND, PERSONAL_STATS_COMMAND, SYNC_COMMAND, LEADERBOARD_COMMAND];
+const ALL_COMMANDS = [
+  TEST_COMMAND, 
+  PERSONAL_STATS_COMMAND, 
+  SYNC_COMMAND, 
+  ELO_LEADERBOARD_COMMAND,
+  AVERAGE_LEADERBOARD_COMMAND
+];
 
 InstallGlobalCommands(process.env.APP_ID, ALL_COMMANDS);

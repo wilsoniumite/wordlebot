@@ -81,11 +81,261 @@ app.use('/interactions', (req, res, next) => {
   next();
 });
 
+// Shared leaderboard generation function
+async function generateLeaderboard(req, res, statsMethod) {
+  try {
+    const { options } = req.body.data;
+    
+    // Parse options
+    const optionsMap = {};
+    if (options) {
+      options.forEach(option => {
+        optionsMap[option.name] = option.value;
+      });
+    }
+    
+    const channelId = req.body.channel_id;
+    const guildId = req.body.guild_id;
+    const channelOnly = optionsMap.channel_only || false;
+    
+    // Send initial ephemeral response
+    res.send({
+      type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        flags: 64 // EPHEMERAL
+      }
+    });
+    
+    // Fetch messages from this channel
+    console.log('Fetching messages for channel', channelId);
+    const messages = await fetchChannelMessages(channelId, 1000);
+    console.log(`Fetched ${messages.length} messages`);
+    
+    const channelScores = await parseWordleResults(messages, guildId);
+    console.log(`Parsed results for ${Object.keys(channelScores).length} days from channel`);
+    
+    if (Object.keys(channelScores).length === 0) {
+      return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: 'No Wordle results found in this channel! 😅'
+        })
+      });
+    }
+    
+    // Save channel results to database
+    console.log('Saving results to database...');
+    const saveResult = await saveWordleResults(channelScores);
+    console.log(`Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
+    
+    // Determine which data to use for leaderboard
+    let scores;
+    if (channelOnly) {
+      console.log('Using channel-only data for leaderboard');
+      scores = channelScores;
+    } else {
+      console.log('Fetching all data from database for leaderboard');
+      // Get all user IDs from channel to maintain the userId (not hash) in results
+      const channelUserIds = [...new Set(
+        Object.values(channelScores).flat().map(([userId, score]) => userId)
+      )];
+      
+      // Fetch all data from database for these users
+      scores = await getWordleResults(channelUserIds);
+      
+      console.log(`Using database data: ${Object.keys(scores).length} days`);
+    }
+    
+    // Filter out score 7 (X/failed) if xIsSeven is false
+    const xIsSeven = optionsMap.x_is_seven || false;
+    scores = filterScores(scores, xIsSeven);
+    console.log(`After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
+    
+    // Get all unique user IDs and fetch their usernames
+    const allUserIds = [...new Set(
+      Object.values(scores).flat().map(([userId, score]) => userId)
+    )];
+    
+    console.log(`Fetching usernames for ${allUserIds.length} users`);
+    const userIdToUsername = {};
+    
+    // Fetch usernames sequentially with small delays
+    // The retry logic in fetchUserInfo will handle any rate limits
+    for (const userId of allUserIds) {
+      const username = await fetchUserInfo(userId);
+      userIdToUsername[userId] = username;
+      
+      // Small delay between requests to be respectful
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    const leaderboardOptions = {
+      xIsSeven: xIsSeven,
+      gameCutoff: optionsMap.game_cutoff || 3,
+      statsMethod: statsMethod,
+      eloMethod: optionsMap.elo_method || 'Iterated',
+      eloK: optionsMap.elo_k || 2.0,
+      dayAdjustment: optionsMap.day_adjustment !== false,
+      bayesAdjustment: optionsMap.bayes_adjustment !== false
+    };
+    
+    console.log('Calculating leaderboard...');
+    const leaderboard = calculateLeaderboard(scores, leaderboardOptions);
+    
+    // Convert user IDs to usernames in the leaderboard
+    const leaderboardWithUsernames = leaderboard.map(entry => ({
+      ...entry,
+      player: userIdToUsername[entry.player] || entry.player
+    }));
+    
+    // Generate SVG
+    console.log('Generating SVG leaderboard...');
+    const dataSource = channelOnly ? ' (Channel Only)' : ' (All Channels)';
+    const svgContent = generateLeaderboardSVG(
+      leaderboardWithUsernames,
+      statsMethod,
+      dataSource
+    );
+    
+    // Convert SVG to PNG using sharp
+    console.log('Converting SVG to PNG...');
+    const pngBuffer = await sharp(Buffer.from(svgContent))
+      .png()
+      .toBuffer();
+    
+    // Create FormData and attach the PNG
+    const formData = new FormData();
+    
+    // Create a File object from the PNG buffer
+    const pngFile = new File([pngBuffer], 'leaderboard.png', { type: 'image/png' });
+    formData.append('files[0]', pngFile);
+    
+    // Add the message payload with a "Publish" button
+    formData.append('payload_json', JSON.stringify({
+      content: `📊 **Leaderboard Preview**${dataSource}\n*This is only visible to you. Click "Publish" to share it with everyone.*`,
+      components: [
+        {
+          type: MessageComponentTypes.ACTION_ROW,
+          components: [
+            {
+              type: MessageComponentTypes.BUTTON,
+              style: ButtonStyleTypes.PRIMARY,
+              label: '📢 Publish Leaderboard',
+              custom_id: 'publish_leaderboard'
+            }
+          ]
+        }
+      ]
+    }));
+    
+    // Send ephemeral message with button
+    await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
+      method: 'PATCH',
+      body: formData
+    });
+    
+  } catch (error) {
+    console.error('Error generating leaderboard:', error);
+    console.error(error.stack);
+    await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `Sorry, there was an error generating the leaderboard! 😞\n\`\`\`${error.message}\`\`\``
+      })
+    });
+  }
+}
+
 app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async function (req, res) {
   const { id, type, data } = req.body;
   
   if (type === InteractionType.PING) {
     return res.send({ type: InteractionResponseType.PONG });
+  }
+  
+  if (type === InteractionType.MESSAGE_COMPONENT) {
+    const { custom_id } = data;
+    
+    if (custom_id === 'publish_leaderboard') {
+      try {
+        // Get the attachment from the ephemeral message
+        const message = req.body.message;
+        const attachment = message?.attachments?.[0];
+        
+        console.log('[Publish] Message:', message ? 'found' : 'not found');
+        console.log('[Publish] Attachments:', message?.attachments?.length || 0);
+        
+        if (!attachment) {
+          console.error('[Publish] No attachment found. Message structure:', JSON.stringify(message, null, 2));
+          return res.send({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: {
+              content: '❌ Could not find leaderboard image to publish.',
+              flags: 64 // EPHEMERAL
+            }
+          });
+        }
+        
+        console.log('[Publish] Found attachment:', attachment.filename || attachment.id);
+        
+        // Send deferred response
+        res.send({
+          type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE
+        });
+        
+        // Fetch the image from the attachment URL
+        console.log('[Publish] Fetching image from URL:', attachment.url);
+        const imageResponse = await fetch(attachment.url);
+        const imageBuffer = await imageResponse.arrayBuffer();
+        
+        // Create FormData with the image
+        const formData = new FormData();
+        const imageFile = new File([imageBuffer], 'leaderboard.png', { type: 'image/png' });
+        formData.append('files[0]', imageFile);
+        
+        // Post as a new message in the channel (public)
+        formData.append('payload_json', JSON.stringify({
+          content: '📊 Wordle Leaderboard'
+        }));
+        
+        // Post to channel
+        console.log('[Publish] Posting leaderboard to channel:', req.body.channel_id);
+        await fetch(`https://discord.com/api/v10/channels/${req.body.channel_id}/messages`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bot ${process.env.DISCORD_TOKEN}`
+          },
+          body: formData
+        });
+        
+        console.log('[Publish] Successfully posted to channel');
+        
+        // Update the ephemeral message to show it was published
+        await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: '✅ Leaderboard published!',
+            components: [] // Remove the button
+          })
+        });
+        
+      } catch (error) {
+        console.error('[Publish] Error publishing leaderboard:', error);
+        console.error('[Publish] Stack trace:', error.stack);
+        await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: `❌ Error publishing leaderboard: ${error.message}`,
+            components: []
+          })
+        });
+      }
+      return;
+    }
   }
   
   if (type === InteractionType.APPLICATION_COMMAND) {
@@ -281,152 +531,13 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
       return;
     }
     
-    if (name === 'leaderboard') {
-      try {
-        // Parse options
-        const optionsMap = {};
-        if (options) {
-          options.forEach(option => {
-            optionsMap[option.name] = option.value;
-          });
-        }
-        
-        const channelId = req.body.channel_id;
-        const guildId = req.body.guild_id;
-        const channelOnly = optionsMap.channel_only || false;
-        
-        // Send initial response
-        res.send({
-          type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-        });
-        
-        // Fetch messages from this channel
-        console.log('Fetching messages for channel', channelId);
-        const messages = await fetchChannelMessages(channelId, 1000);
-        console.log(`Fetched ${messages.length} messages`);
-        
-        const channelScores = await parseWordleResults(messages, guildId);
-        console.log(`Parsed results for ${Object.keys(channelScores).length} days from channel`);
-        
-        if (Object.keys(channelScores).length === 0) {
-          return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              content: 'No Wordle results found in this channel! 😅'
-            })
-          });
-        }
-        
-        // Save channel results to database
-        console.log('Saving results to database...');
-        const saveResult = await saveWordleResults(channelScores);
-        console.log(`Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
-        
-        // Determine which data to use for leaderboard
-        let scores;
-        if (channelOnly) {
-          console.log('Using channel-only data for leaderboard');
-          scores = channelScores;
-        } else {
-          console.log('Fetching all data from database for leaderboard');
-          // Get all user IDs from channel to maintain the userId (not hash) in results
-          const channelUserIds = [...new Set(
-            Object.values(channelScores).flat().map(([userId, score]) => userId)
-          )];
-          
-          // Fetch all data from database for these users
-          scores = await getWordleResults(channelUserIds);
-          
-          console.log(`Using database data: ${Object.keys(scores).length} days`);
-        }
-        
-        // Filter out score 7 (X/failed) if xIsSeven is false
-        const xIsSeven = optionsMap.x_is_seven || false;
-        scores = filterScores(scores, xIsSeven);
-        console.log(`After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
-        
-        // Get all unique user IDs and fetch their usernames
-        const allUserIds = [...new Set(
-          Object.values(scores).flat().map(([userId, score]) => userId)
-        )];
-        
-        console.log(`Fetching usernames for ${allUserIds.length} users`);
-        const userIdToUsername = {};
-        
-        // Fetch usernames sequentially with small delays
-        // The retry logic in fetchUserInfo will handle any rate limits
-        for (const userId of allUserIds) {
-          const username = await fetchUserInfo(userId);
-          userIdToUsername[userId] = username;
-          
-          // Small delay between requests to be respectful
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-        
-        const leaderboardOptions = {
-          xIsSeven: xIsSeven,
-          gameCutoff: optionsMap.game_cutoff || 3,
-          statsMethod: optionsMap.stats_method || 'Elo',
-          eloMethod: optionsMap.elo_method || 'Iterated',
-          eloK: optionsMap.elo_k || 2.0,
-          dayAdjustment: optionsMap.day_adjustment !== false,
-          bayesAdjustment: optionsMap.bayes_adjustment !== false
-        };
-        
-        console.log('Calculating leaderboard...');
-        const leaderboard = calculateLeaderboard(scores, leaderboardOptions);
-        
-        // Convert user IDs to usernames in the leaderboard
-        const leaderboardWithUsernames = leaderboard.map(entry => ({
-          ...entry,
-          player: userIdToUsername[entry.player] || entry.player
-        }));
-        
-        // Generate SVG
-        console.log('Generating SVG leaderboard...');
-        const dataSource = channelOnly ? ' (Channel Only)' : ' (All Channels)';
-        const svgContent = generateLeaderboardSVG(
-          leaderboardWithUsernames,
-          optionsMap.stats_method || 'Elo',
-          dataSource
-        );
-        
-        // Convert SVG to PNG using sharp
-        console.log('Converting SVG to PNG...');
-        const pngBuffer = await sharp(Buffer.from(svgContent))
-          .png()
-          .toBuffer();
-        
-        // Create FormData and attach the PNG
-        const formData = new FormData();
-        
-        // Create a File object from the PNG buffer
-        const pngFile = new File([pngBuffer], 'leaderboard.png', { type: 'image/png' });
-        formData.append('files[0]', pngFile);
-        
-        // Add the message payload
-        formData.append('payload_json', JSON.stringify({
-          content: `📊 Leaderboard${dataSource}`
-        }));
-        
-        // Send to Discord webhook
-        await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
-          method: 'PATCH',
-          body: formData
-        });
-        
-      } catch (error) {
-        console.error('Error generating leaderboard:', error);
-        console.error(error.stack);
-        await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            content: `Sorry, there was an error generating the leaderboard! 😞\n\`\`\`${error.message}\`\`\``
-          })
-        });
-      }
+    if (name === 'elo_leaderboard') {
+      await generateLeaderboard(req, res, 'Elo');
+      return;
+    }
+    
+    if (name === 'average_leaderboard') {
+      await generateLeaderboard(req, res, 'Average');
       return;
     }
     

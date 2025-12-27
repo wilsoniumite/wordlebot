@@ -1,5 +1,8 @@
 import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
+import tesseract from 'node-tesseract-ocr';
+import { writeFile } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 // Utility functions for Elo calculations (based on utils.py)
 function geometricMean(arr) {
@@ -336,8 +339,9 @@ async function buildUsernameMapping(guildId) {
 
 // Extract Wordle number from image using OCR
 async function extractWordleNumber(imageUrl) {
+  let tempFile = null;
+  
   try {
-    
     // Fetch the image
     const response = await fetch(imageUrl);
     const buffer = await response.arrayBuffer();
@@ -345,24 +349,29 @@ async function extractWordleNumber(imageUrl) {
     // Crop to just the top portion with "Wordle No. 1567"
     const cropped = await sharp(Buffer.from(buffer))
       .extract({
-        left: 141,    // x position
-        top: 0,       // y position
-        width: 230,   // width of crop
-        height: 40    // height of crop (just enough for the text)
+        left: 141,
+        top: 0,
+        width: 230,
+        height: 40
       })
       .toBuffer();
     
-    // OCR the cropped image
-    const { data: { text } } = await Tesseract.recognize(cropped, 'eng', {
-      logger: () => {} // Suppress verbose logs
+    // Save to temporary file (node-tesseract-ocr needs a file path)
+    tempFile = join(tmpdir(), `wordle-ocr-${Date.now()}.png`);
+    await writeFile(tempFile, cropped);
+    
+    // OCR with native Tesseract
+    const text = await tesseract.recognize(tempFile, {
+      lang: 'eng',
+      oem: 1,
+      psm: 7, // Treat image as a single text line
     });
     
     // Extract number from text like "Wordle No. 1567" or "Wordle 1567"
     const match = text.match(/Wordle\s+(?:No\.?\s+)?(\d+)/i);
     
     if (match) {
-      const wordleNumber = parseInt(match[1]);
-      return wordleNumber;
+      return parseInt(match[1]);
     }
     
     console.warn(`  ✗ Could not extract Wordle number from image. Text found: ${text.substring(0, 100)}`);
@@ -370,6 +379,15 @@ async function extractWordleNumber(imageUrl) {
   } catch (error) {
     console.error(`  ✗ Error extracting Wordle number:`, error.message);
     return null;
+  } finally {
+    // Clean up temp file
+    if (tempFile) {
+      try {
+        await unlink(tempFile);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
   }
 }
 

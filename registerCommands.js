@@ -68,7 +68,7 @@ const SYNC_COMMAND = {
       type: 4, // INTEGER
       required: false,
       min_value: 100,
-      max_value: 5000
+      max_value: 50000
     }
   ]
 };

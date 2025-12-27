@@ -15,19 +15,27 @@ export function hashUserId(userId) {
 }
 
 // Save wordle results to database
-export async function saveWordleResults(scores) {
+// scores format: { 
+//   wordleNumber: [
+//     { userId, score, messageId },
+//     ...
+//   ]
+// }
+// channelId: Discord channel snowflake ID (string or number)
+export async function saveWordleResults(scores, channelId) {
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
     
     const insertQuery = `
-      INSERT INTO wordle_results (user_id_hash, wordle_number, completed_at, score)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (user_id_hash, wordle_number) 
+      INSERT INTO wordle_results (user_id_hash, wordle_number, completed_at, score, channel_id, message_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (user_id_hash, wordle_number, channel_id) 
       DO UPDATE SET 
         score = EXCLUDED.score,
-        completed_at = EXCLUDED.completed_at
+        completed_at = EXCLUDED.completed_at,
+        message_id = COALESCE(EXCLUDED.message_id, wordle_results.message_id)
       RETURNING (xmax = 0) AS inserted
     `;
     
@@ -38,14 +46,16 @@ export async function saveWordleResults(scores) {
     for (const [wordleNumber, dayResults] of Object.entries(scores)) {
       const completedAt = new Date(); // Use current timestamp
       
-      for (const [userId, score] of dayResults) {
-        const userIdHash = hashUserId(userId);
+      for (const entry of dayResults) {
+        const userIdHash = hashUserId(entry.userId);
         
         const result = await client.query(insertQuery, [
           userIdHash,
           parseInt(wordleNumber),
           completedAt,
-          score
+          entry.score,
+          channelId.toString(), // Discord snowflakes as strings to avoid precision loss
+          entry.messageId ? entry.messageId.toString() : null
         ]);
         
         insertCount++;
@@ -60,7 +70,7 @@ export async function saveWordleResults(scores) {
     }
     
     await client.query('COMMIT');
-    console.log(`Saved ${insertCount} wordle results to database (${newCount} new, ${updatedCount} updated)`);
+    console.log(`Saved ${insertCount} wordle results to database (${newCount} new, ${updatedCount} updated) for channel ${channelId}`);
     
     return { total: insertCount, new: newCount, updated: updatedCount };
   } catch (error) {
@@ -73,18 +83,28 @@ export async function saveWordleResults(scores) {
 }
 
 // Get wordle results from database
-// Returns in the same format as parseWordleResults: { wordleNumber: [[userId, score], ...], ... }
-export async function getWordleResults(userIds = null, startNumber = null, endNumber = null) {
+// Returns: { wordleNumber: [{ userId, score, channelId }], ... }
+// NOTE: May contain duplicates (same userId + wordleNumber in different channels)
+// Use deduplicateScores() helper to remove duplicates with channel priority
+// channelId: optional filter by specific channel (null = all channels, '0' = legacy data)
+export async function getWordleResults(userIds = null, startNumber = null, endNumber = null, channelId = null) {
   const client = await pool.connect();
   
   try {
     let query = `
-      SELECT user_id_hash, wordle_number, score
+      SELECT user_id_hash, wordle_number, score, channel_id, message_id
       FROM wordle_results
       WHERE 1=1
     `;
     const params = [];
     let paramCount = 1;
+    
+    // Filter by channel ID if provided
+    if (channelId !== null) {
+      query += ` AND channel_id = $${paramCount}`;
+      params.push(channelId.toString());
+      paramCount++;
+    }
     
     // Filter by user IDs if provided
     if (userIds && userIds.length > 0) {
@@ -111,7 +131,7 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
     
     const result = await client.query(query, params);
     
-    // Convert to the same format as parseWordleResults
+    // Convert to the format needed by calculateLeaderboard
     const scores = {};
     const hashToUserId = {};
     
@@ -131,10 +151,18 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
       
       // Use the original userId if we have it in the mapping, otherwise use the hash
       const userId = hashToUserId[row.user_id_hash] || row.user_id_hash;
-      scores[wordleNumber].push([userId, row.score]);
+      
+      // Return in object format { userId, score, channelId }
+      // channelId is needed for deduplication
+      scores[wordleNumber].push({ 
+        userId, 
+        score: row.score,
+        channelId: row.channel_id 
+      });
     }
     
-    console.log(`Retrieved results for ${Object.keys(scores).length} wordle puzzles from database`);
+    const channelInfo = channelId ? ` for channel ${channelId}` : '';
+    console.log(`Retrieved results for ${Object.keys(scores).length} wordle puzzles from database${channelInfo}`);
     
     return scores;
   } catch (error) {
@@ -146,13 +174,20 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
 }
 
 // Get all unique user ID hashes in the database
-export async function getAllUserIdHashes() {
+// channelId: optional filter by specific channel
+export async function getAllUserIdHashes(channelId = null) {
   const client = await pool.connect();
   
   try {
-    const result = await client.query(
-      'SELECT DISTINCT user_id_hash FROM wordle_results'
-    );
+    let query = 'SELECT DISTINCT user_id_hash FROM wordle_results';
+    const params = [];
+    
+    if (channelId !== null) {
+      query += ' WHERE channel_id = $1';
+      params.push(channelId.toString());
+    }
+    
+    const result = await client.query(query, params);
     
     return result.rows.map(row => row.user_id_hash);
   } catch (error) {
@@ -164,72 +199,152 @@ export async function getAllUserIdHashes() {
 }
 
 // Get detailed statistics for a specific user
-export async function getUserStats(userId) {
+// Deduplicates by (user_id_hash, wordle_number) using channel priority
+// channelId: optional preferred channel for deduplication (null = use lowest non-zero, then 0)
+export async function getUserStats(userId, channelId = null) {
   const client = await pool.connect();
   
   try {
     const userIdHash = hashUserId(userId);
     
-    // Get overall stats
-    const overallResult = await client.query(
+    // Use DISTINCT ON to pick one row per wordle_number based on priority
+    // Priority: 1) channelId (if provided), 2) lowest non-zero channel_id, 3) channel_id 0
+    const channelPriority = channelId !== null ? `
+      DISTINCT ON (wordle_number)
+      wordle_number,
+      score,
+      channel_id,
+      message_id,
+      completed_at,
+      CASE 
+        WHEN channel_id = $2 THEN 1
+        WHEN channel_id > 0 THEN 2
+        ELSE 3
+      END as priority
+    ` : `
+      DISTINCT ON (wordle_number)
+      wordle_number,
+      score,
+      channel_id,
+      message_id,
+      completed_at,
+      CASE 
+        WHEN channel_id > 0 THEN 1
+        ELSE 2
+      END as priority
+    `;
+    
+    const orderBy = channelId !== null ? `
+      ORDER BY wordle_number, 
+        CASE 
+          WHEN channel_id = $2 THEN 1
+          WHEN channel_id > 0 THEN 2
+          ELSE 3
+        END,
+        channel_id
+    ` : `
+      ORDER BY wordle_number,
+        CASE 
+          WHEN channel_id > 0 THEN 1
+          ELSE 2
+        END,
+        channel_id
+    `;
+    
+    const params = channelId !== null ? [userIdHash, channelId.toString()] : [userIdHash];
+    
+    // Get deduplicated games for this user
+    const deduplicatedGames = await client.query(
       `
-      SELECT 
-        COUNT(*) as total_games,
-        ROUND(AVG(score), 2) as avg_score,
-        MIN(score) as best_score,
-        MAX(score) as worst_score,
-        MIN(wordle_number) as first_wordle,
-        MAX(wordle_number) as last_wordle
+      SELECT ${channelPriority}
       FROM wordle_results
       WHERE user_id_hash = $1
+      ${orderBy}
       `,
-      [userIdHash]
+      params
     );
     
-    // Get score distribution
-    const distributionResult = await client.query(
-      `
-      SELECT 
-        score,
-        COUNT(*) as count
-      FROM wordle_results
-      WHERE user_id_hash = $1
-      GROUP BY score
-      ORDER BY score
-      `,
-      [userIdHash]
-    );
+    if (deduplicatedGames.rows.length === 0) {
+      // No games found
+      return {
+        totalGames: 0,
+        avgScore: 0,
+        bestScore: 0,
+        worstScore: 0,
+        firstWordle: 0,
+        lastWordle: 0,
+        distribution: [],
+        recent: []
+      };
+    }
+    
+    // Calculate stats from deduplicated data
+    const scores = deduplicatedGames.rows.map(r => r.score);
+    const totalGames = scores.length;
+    const avgScore = scores.reduce((sum, s) => sum + s, 0) / totalGames;
+    const bestScore = Math.min(...scores);
+    const worstScore = Math.max(...scores);
+    const firstWordle = Math.min(...deduplicatedGames.rows.map(r => r.wordle_number));
+    const lastWordle = Math.max(...deduplicatedGames.rows.map(r => r.wordle_number));
+    
+    // Calculate distribution
+    const distribution = {};
+    for (const row of deduplicatedGames.rows) {
+      distribution[row.score] = (distribution[row.score] || 0) + 1;
+    }
+    
+    const distributionArray = Object.entries(distribution)
+      .map(([score, count]) => ({ score: parseInt(score), count }))
+      .sort((a, b) => a.score - b.score);
     
     // Get recent games (last 10)
-    const recentResult = await client.query(
-      `
-      SELECT 
-        wordle_number,
-        score
-      FROM wordle_results
-      WHERE user_id_hash = $1
-      ORDER BY wordle_number DESC
-      LIMIT 10
-      `,
-      [userIdHash]
-    );
-    
-    const overall = overallResult.rows[0];
-    const distribution = distributionResult.rows;
-    const recent = recentResult.rows;
+    const recent = deduplicatedGames.rows
+      .sort((a, b) => b.wordle_number - a.wordle_number)
+      .slice(0, 10)
+      .map(r => ({
+        wordleNumber: r.wordle_number,
+        score: r.score,
+        channelId: r.channel_id,
+        messageId: r.message_id
+      }));
     
     return {
-      totalGames: parseInt(overall.total_games),
-      avgScore: parseFloat(overall.avg_score),
-      bestScore: parseInt(overall.best_score),
-      worstScore: parseInt(overall.worst_score),
-      firstWordle: parseInt(overall.first_wordle),
-      lastWordle: parseInt(overall.last_wordle),
-      distribution: distribution.map(d => ({ score: parseInt(d.score), count: parseInt(d.count) })),
-      recent: recent.map(r => ({ wordleNumber: parseInt(r.wordle_number), score: parseInt(r.score) }))
+      totalGames,
+      avgScore: parseFloat(avgScore.toFixed(2)),
+      bestScore,
+      worstScore,
+      firstWordle,
+      lastWordle,
+      distribution: distributionArray,
+      recent
     };
   } catch (error) {
     console.error('Error getting user stats:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// Get all results from a specific message ID
+// Returns array of all rows with that message_id (can be multiple users)
+export async function getResultsByMessageId(messageId) {
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query(
+      `
+      SELECT user_id_hash, wordle_number, score, channel_id, message_id, completed_at
+      FROM wordle_results
+      WHERE message_id = $1
+      ORDER BY user_id_hash
+      `,
+      [messageId.toString()]
+    );
+    
+    return result.rows; // Returns array (can be empty, or have multiple rows)
+  } catch (error) {
+    console.error('Error getting results by message ID:', error);
     throw error;
   } finally {
     client.release();

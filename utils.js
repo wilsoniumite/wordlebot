@@ -1,6 +1,6 @@
 import sharp from 'sharp';
 import tesseract from 'node-tesseract-ocr';
-import { writeFile } from 'fs/promises';
+import { writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -104,17 +104,17 @@ export function calcEloIterated(scores, allPlayers, k = 2, maxScore = 6) {
     // Copy previous day's Elos
     currentElos = [...currentElos];
     
-    for (const [playerName, score] of day) {
-      const playerIdx = allPlayers.indexOf(playerName);
+    for (const entry of day) {
+      const playerIdx = allPlayers.indexOf(entry.userId);
       if (playerIdx === -1) continue;
       
-      for (const [opponentName, opponentScore] of day) {
-        if (playerName === opponentName) continue;
+      for (const opponentEntry of day) {
+        if (entry.userId === opponentEntry.userId) continue;
         
-        const opponentIdx = allPlayers.indexOf(opponentName);
+        const opponentIdx = allPlayers.indexOf(opponentEntry.userId);
         if (opponentIdx === -1) continue;
         
-        const sa = points(score, opponentScore, maxScore);
+        const sa = points(entry.score, opponentEntry.score, maxScore);
         const [newPlayerElo, newOpponentElo] = calculateElo(
           currentElos[playerIdx],
           currentElos[opponentIdx],
@@ -269,13 +269,97 @@ export function filterScores(scores, xIsSeven) {
   // Filter out score 7 from each day
   const filteredScores = {};
   for (const [date, dayResults] of Object.entries(scores)) {
-    const filtered = dayResults.filter(([userId, score]) => score !== 7);
+    const filtered = dayResults.filter(entry => entry.score !== 7);
     if (filtered.length > 0) {
       filteredScores[date] = filtered;
     }
   }
   
   return filteredScores;
+}
+
+// Deduplicate scores when same user_id + wordle_number appears in multiple channels
+// Priority: 1) preferredChannelId, 2) lowest non-zero channel_id, 3) channel_id 0 (legacy)
+export function deduplicateScores(scores, preferredChannelId = null) {
+  const deduplicated = {};
+  
+  for (const [wordleNumber, dayResults] of Object.entries(scores)) {
+    // Group by userId
+    const userEntries = {};
+    
+    for (const entry of dayResults) {
+      const userId = entry.userId;
+      
+      if (!userEntries[userId]) {
+        userEntries[userId] = [];
+      }
+      
+      userEntries[userId].push(entry);
+    }
+    
+    // For each user, pick the best entry based on priority
+    const deduplicatedDay = [];
+    
+    for (const [userId, entries] of Object.entries(userEntries)) {
+      let selectedEntry = null;
+      
+      if (entries.length === 1) {
+        // Only one entry, use it
+        selectedEntry = entries[0];
+      } else {
+        // Multiple entries - need to prioritize
+        
+        // First, try to find entry from preferred channel
+        if (preferredChannelId !== null) {
+          const preferredEntry = entries.find(e => 
+            e.channelId && e.channelId.toString() === preferredChannelId.toString()
+          );
+          if (preferredEntry) {
+            selectedEntry = preferredEntry;
+          }
+        }
+        
+        // If not found, try to find entry with non-zero channel_id (lowest one)
+        if (!selectedEntry) {
+          const nonZeroEntries = entries
+            .filter(e => e.channelId && e.channelId.toString() !== '0')
+            .sort((a, b) => {
+              // Sort by channel_id numerically (convert to BigInt for comparison)
+              const aId = BigInt(a.channelId);
+              const bId = BigInt(b.channelId);
+              return aId < bId ? -1 : aId > bId ? 1 : 0;
+            });
+          
+          if (nonZeroEntries.length > 0) {
+            selectedEntry = nonZeroEntries[0]; // Lowest non-zero channel_id
+          }
+        }
+        
+        // If still not found, use entry with channel_id 0 (legacy)
+        if (!selectedEntry) {
+          const legacyEntry = entries.find(e => 
+            !e.channelId || e.channelId.toString() === '0'
+          );
+          if (legacyEntry) {
+            selectedEntry = legacyEntry;
+          }
+        }
+        
+        // Fallback: just use the first entry (shouldn't happen)
+        if (!selectedEntry) {
+          selectedEntry = entries[0];
+        }
+      }
+      
+      deduplicatedDay.push(selectedEntry);
+    }
+    
+    if (deduplicatedDay.length > 0) {
+      deduplicated[wordleNumber] = deduplicatedDay;
+    }
+  }
+  
+  return deduplicated;
 }
 
 // Build a mapping of nicknames to user IDs from guild members
@@ -391,6 +475,8 @@ async function extractWordleNumber(imageUrl) {
   }
 }
 
+// Parse Wordle results from Discord messages
+// Returns: { wordleNumber: [{ userId, score, messageId }, ...] }
 export async function parseWordleResults(messages, guildId) {
   // Build username to ID mapping from guild members
   const { usernameToUserId } = await buildUsernameMapping(guildId);
@@ -456,7 +542,12 @@ export async function parseWordleResults(messages, guildId) {
           }
           
           if (userId && /^\d{17,19}$/.test(userId)) {
-            dayResults.push([userId, score]);
+            // Return object with messageId
+            dayResults.push({
+              userId,
+              score,
+              messageId: message.id  // Include the Discord message ID
+            });
           }
         }
       }
@@ -470,6 +561,7 @@ export async function parseWordleResults(messages, guildId) {
 }
 
 // Function to calculate leaderboard
+// scores format: { wordleNumber: [{ userId, score }, ...] }
 export function calculateLeaderboard(scores, options) {
   const {
     xIsSeven = false,
@@ -483,7 +575,7 @@ export function calculateLeaderboard(scores, options) {
   
   // Get all players
   const allPlayers = [...new Set(
-    Object.values(scores).flat().map(([player, score]) => player)
+    Object.values(scores).flat().map(entry => entry.userId)
   )];
   
   // Count games per player
@@ -491,7 +583,7 @@ export function calculateLeaderboard(scores, options) {
   for (const player of allPlayers) {
     numGames[player] = Object.values(scores)
       .flat()
-      .filter(([p, s]) => p === player).length;
+      .filter(entry => entry.userId === player).length;
   }
   
   if (statsMethod === 'Elo') {
@@ -506,14 +598,14 @@ export function calculateLeaderboard(scores, options) {
         .map(() => Array(allPlayers.length).fill(0));
       
       for (const dayGames of Object.values(scores)) {
-        for (const [player1, score1] of dayGames) {
-          for (const [player2, score2] of dayGames) {
-            if (player1 === player2) continue;
+        for (const entry1 of dayGames) {
+          for (const entry2 of dayGames) {
+            if (entry1.userId === entry2.userId) continue;
             
-            const idx1 = playerIndex[player1];
-            const idx2 = playerIndex[player2];
+            const idx1 = playerIndex[entry1.userId];
+            const idx2 = playerIndex[entry2.userId];
             
-            winMatrix[idx1][idx2] += points(score1, score2, xIsSeven ? 7 : 6);
+            winMatrix[idx1][idx2] += points(entry1.score, entry2.score, xIsSeven ? 7 : 6);
           }
         }
       }
@@ -562,9 +654,9 @@ export function calculateLeaderboard(scores, options) {
     for (const [date, dayGames] of Object.entries(scores)) {
       allScoresByDay[dayIndex] = [];
       
-      for (const [player, score] of dayGames) {
-        allScoresByDay[dayIndex].push(score);
-        playerDayScores[player][dayIndex] = score;
+      for (const entry of dayGames) {
+        allScoresByDay[dayIndex].push(entry.score);
+        playerDayScores[entry.userId][dayIndex] = entry.score;
       }
       dayIndex++;
     }

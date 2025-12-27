@@ -18,7 +18,8 @@ import {
   calculateLeaderboard,
   generateLeaderboardSVG,
   fetchUserInfo,
-  filterScores
+  filterScores,
+  deduplicateScores
 } from './utils.js';
 
 import {
@@ -111,6 +112,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     const messages = await fetchChannelMessages(channelId, 1000);
     console.log(`Fetched ${messages.length} messages`);
     
+    // parseWordleResults returns: { wordleNumber: [{ userId, score, messageId }, ...] }
     const channelScores = await parseWordleResults(messages, guildId);
     console.log(`Parsed results for ${Object.keys(channelScores).length} days from channel`);
     
@@ -124,9 +126,9 @@ async function generateLeaderboard(req, res, statsMethod) {
       });
     }
     
-    // Save channel results to database
+    // Save channel results to database with channel ID and message IDs
     console.log('Saving results to database...');
-    const saveResult = await saveWordleResults(channelScores);
+    const saveResult = await saveWordleResults(channelScores, channelId);
     console.log(`Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
     
     // Determine which data to use for leaderboard
@@ -138,10 +140,13 @@ async function generateLeaderboard(req, res, statsMethod) {
       console.log('Fetching all data from database for leaderboard');
       // Get all user IDs from channel to maintain the userId (not hash) in results
       const channelUserIds = [...new Set(
-        Object.values(channelScores).flat().map(([userId, score]) => userId)
+        Object.values(channelScores).flat().map(entry => entry.userId)
       )];
       
       // Fetch all data from database for these users
+      // getWordleResults returns: { wordleNumber: [{ userId, score }, ...] }
+      // Note: This gets data from ALL channels. To get only this channel's data from DB,
+      // pass channelId as the 4th parameter: getWordleResults(channelUserIds, null, null, channelId)
       scores = await getWordleResults(channelUserIds);
       
       console.log(`Using database data: ${Object.keys(scores).length} days`);
@@ -152,9 +157,14 @@ async function generateLeaderboard(req, res, statsMethod) {
     scores = filterScores(scores, xIsSeven);
     console.log(`After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
     
+    // Deduplicate scores (same user + wordle number in different channels)
+    // Priority: current channel, then lowest non-zero channel, then legacy (0)
+    scores = deduplicateScores(scores, channelId);
+    console.log(`After deduplication: ${Object.keys(scores).length} days`);
+    
     // Get all unique user IDs and fetch their usernames
     const allUserIds = [...new Set(
-      Object.values(scores).flat().map(([userId, score]) => userId)
+      Object.values(scores).flat().map(entry => entry.userId)
     )];
     
     console.log(`Fetching usernames for ${allUserIds.length} users`);
@@ -377,6 +387,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         const messages = await fetchChannelMessages(channelId, messageLimit);
         console.log(`[Sync] Fetched ${messages.length} messages`);
         
+        // parseWordleResults returns: { wordleNumber: [{ userId, score, messageId }, ...] }
         const channelScores = await parseWordleResults(messages, guildId);
         console.log(`[Sync] Parsed results for ${Object.keys(channelScores).length} days`);
         
@@ -394,12 +405,12 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         const totalPuzzles = Object.keys(channelScores).length;
         const totalGames = Object.values(channelScores).reduce((sum, day) => sum + day.length, 0);
         const uniqueUsers = new Set(
-          Object.values(channelScores).flat().map(([userId, score]) => userId)
+          Object.values(channelScores).flat().map(entry => entry.userId)
         ).size;
         
-        // Save to database
+        // Save to database with channel ID and message IDs
         console.log('[Sync] Saving results to database...');
-        const saveResult = await saveWordleResults(channelScores);
+        const saveResult = await saveWordleResults(channelScores, channelId);
         
         // Send success message (ephemeral)
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
@@ -433,6 +444,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
       try {
         // Get the user ID from the interaction
         const userId = req.body.member?.user?.id || req.body.user?.id;
+        const channelId = req.body.channel_id;
         
         if (!userId) {
           return res.send({
@@ -453,8 +465,9 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         });
         
         // Get user stats from database
-        console.log(`[PersonalStats] Fetching stats for user ${userId}`);
-        const stats = await getUserStats(userId);
+        // Pass channelId for channel-aware deduplication
+        console.log(`[PersonalStats] Fetching stats for user ${userId} in channel ${channelId}`);
+        const stats = await getUserStats(userId, channelId);
         
         if (stats.totalGames === 0) {
           return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {

@@ -13,8 +13,7 @@ import {
 } from 'discord-interactions';
 
 import {
-  fetchChannelMessages,
-  parseWordleResults,
+  fetchAndParseMessages,
   calculateLeaderboard,
   generateLeaderboardSVG,
   fetchUserInfo,
@@ -25,8 +24,7 @@ import {
 import {
   saveWordleResults,
   getWordleResults,
-  getUserStats,
-  hashUserId
+  getUserStats
 } from './db.js';
 
 const UMAMI_URL = process.env.UMAMI_URL;
@@ -82,7 +80,7 @@ app.use('/interactions', (req, res, next) => {
   next();
 });
 
-// Shared leaderboard generation function
+// Shared leaderboard generation function - OPTIMIZED VERSION
 async function generateLeaderboard(req, res, statsMethod) {
   try {
     const { options } = req.body.data;
@@ -107,14 +105,51 @@ async function generateLeaderboard(req, res, statsMethod) {
       }
     });
     
-    // Fetch messages from this channel
-    console.log('Fetching messages for channel', channelId);
-    const messages = await fetchChannelMessages(channelId, 1000);
-    console.log(`Fetched ${messages.length} messages`);
+    // OPTIMIZATION: First, get existing data from DB for this channel
+    console.log('[Leaderboard] Fetching existing data from DB for channel', channelId);
+    const existingScores = await getWordleResults(null, null, null, channelId);
+    console.log(`[Leaderboard] Found ${Object.keys(existingScores).length} days in DB for this channel`);
     
-    // parseWordleResults returns: { wordleNumber: [{ userId, score, messageId }, ...] }
-    const channelScores = await parseWordleResults(messages, guildId);
-    console.log(`Parsed results for ${Object.keys(channelScores).length} days from channel`);
+    // Check for hashed user IDs and collect message IDs in a single pass
+    let hasHashedUsers = false;
+    const existingMessageIds = new Set();
+    
+    for (const dayResults of Object.values(existingScores)) {
+      for (const entry of dayResults) {
+        // Check if this is a hashed entry (64 char hex string with letters)
+        if (entry.userId && entry.userId.length === 64 && /[a-f]/.test(entry.userId)) {
+          hasHashedUsers = true;
+          // Clear message IDs and break early since we can't use early termination with hashed users
+          existingMessageIds.clear();
+          break;
+        }
+        
+        // Collect message IDs for early termination (if no hashed users found)
+        if (entry.messageId) {
+          existingMessageIds.add(entry.messageId);
+        }
+      }
+      if (hasHashedUsers) break;
+    }
+    
+    console.log(`[Leaderboard] ${hasHashedUsers ? 'Hashed users detected - disabling early termination' : `Found ${existingMessageIds.size} message IDs for early termination`}`);
+    
+    // OPTIMIZATION: Use optimized fetch with early termination and parallel processing
+    console.log('[Leaderboard] Fetching messages with parallel processing...');
+    const newScores = await fetchAndParseMessages(channelId, guildId, existingMessageIds, 1000);
+    console.log(`[Leaderboard] Found ${Object.keys(newScores).length} new days from Discord`);
+    
+    // Merge new scores with existing scores
+    const channelScores = { ...existingScores };
+    for (const [wordleNumber, dayResults] of Object.entries(newScores)) {
+      if (channelScores[wordleNumber]) {
+        // Merge with existing data for this day (shouldn't happen often, but handle it)
+        channelScores[wordleNumber] = [...channelScores[wordleNumber], ...dayResults];
+      } else {
+        channelScores[wordleNumber] = dayResults;
+      }
+    }
+    console.log(`[Leaderboard] Total data: ${Object.keys(channelScores).length} days after merge`);
     
     if (Object.keys(channelScores).length === 0) {
       return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
@@ -126,48 +161,49 @@ async function generateLeaderboard(req, res, statsMethod) {
       });
     }
     
-    // Save channel results to database with channel ID and message IDs
-    console.log('Saving results to database...');
-    const saveResult = await saveWordleResults(channelScores, channelId);
-    console.log(`Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
+    // Save NEW results to database (only if we found new data)
+    if (Object.keys(newScores).length > 0) {
+      console.log('[Leaderboard] Saving new results to database...');
+      const saveResult = await saveWordleResults(newScores, channelId);
+      console.log(`[Leaderboard] Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
+    } else {
+      console.log('[Leaderboard] No new results to save - all data was in DB already');
+    }
     
     // Determine which data to use for leaderboard
     let scores;
     if (channelOnly) {
-      console.log('Using channel-only data for leaderboard');
+      console.log('[Leaderboard] Using channel-only data for leaderboard');
       scores = channelScores;
     } else {
-      console.log('Fetching all data from database for leaderboard');
+      console.log('[Leaderboard] Fetching all data from database for leaderboard');
       // Get all user IDs from channel to maintain the userId (not hash) in results
       const channelUserIds = [...new Set(
         Object.values(channelScores).flat().map(entry => entry.userId)
       )];
       
-      // Fetch all data from database for these users
-      // getWordleResults returns: { wordleNumber: [{ userId, score }, ...] }
-      // Note: This gets data from ALL channels. To get only this channel's data from DB,
-      // pass channelId as the 4th parameter: getWordleResults(channelUserIds, null, null, channelId)
+      // Fetch all data from database for these users (all channels)
       scores = await getWordleResults(channelUserIds);
       
-      console.log(`Using database data: ${Object.keys(scores).length} days`);
+      console.log(`[Leaderboard] Using database data: ${Object.keys(scores).length} days`);
     }
     
     // Filter out score 7 (X/failed) if xIsSeven is false
     const xIsSeven = optionsMap.x_is_seven || false;
     scores = filterScores(scores, xIsSeven);
-    console.log(`After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
+    console.log(`[Leaderboard] After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
     
     // Deduplicate scores (same user + wordle number in different channels)
     // Priority: current channel, then lowest non-zero channel, then legacy (0)
     scores = deduplicateScores(scores, channelId);
-    console.log(`After deduplication: ${Object.keys(scores).length} days`);
+    console.log(`[Leaderboard] After deduplication: ${Object.keys(scores).length} days`);
     
     // Get all unique user IDs and fetch their usernames
     const allUserIds = [...new Set(
       Object.values(scores).flat().map(entry => entry.userId)
     )];
     
-    console.log(`Fetching usernames for ${allUserIds.length} users`);
+    console.log(`[Leaderboard] Fetching usernames for ${allUserIds.length} users`);
     const userIdToUsername = {};
     
     // Fetch usernames sequentially with small delays
@@ -190,7 +226,7 @@ async function generateLeaderboard(req, res, statsMethod) {
       bayesAdjustment: optionsMap.bayes_adjustment !== false
     };
     
-    console.log('Calculating leaderboard...');
+    console.log('[Leaderboard] Calculating leaderboard...');
     const leaderboard = calculateLeaderboard(scores, leaderboardOptions);
     
     // Convert user IDs to usernames in the leaderboard
@@ -200,7 +236,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     }));
     
     // Generate SVG
-    console.log('Generating SVG leaderboard...');
+    console.log('[Leaderboard] Generating SVG leaderboard...');
     const dataSource = channelOnly ? ' (Channel Only)' : ' (All Channels)';
     const svgContent = generateLeaderboardSVG(
       leaderboardWithUsernames,
@@ -209,7 +245,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     );
     
     // Convert SVG to PNG using sharp
-    console.log('Converting SVG to PNG...');
+    console.log('[Leaderboard] Converting SVG to PNG...');
     const pngBuffer = await sharp(Buffer.from(svgContent))
       .png()
       .toBuffer();
@@ -246,7 +282,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     });
     
   } catch (error) {
-    console.error('Error generating leaderboard:', error);
+    console.error('[Leaderboard] Error generating leaderboard:', error);
     console.error(error.stack);
     await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
       method: 'PATCH',
@@ -382,13 +418,10 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           }
         });
         
-        // Fetch and parse messages
+        // Fetch and parse messages with parallel processing
+        // Pass empty Set for existingMessageIds to disable early termination
         console.log(`[Sync] Fetching up to ${messageLimit} messages from channel ${channelId}`);
-        const messages = await fetchChannelMessages(channelId, messageLimit);
-        console.log(`[Sync] Fetched ${messages.length} messages`);
-        
-        // parseWordleResults returns: { wordleNumber: [{ userId, score, messageId }, ...] }
-        const channelScores = await parseWordleResults(messages, guildId);
+        const channelScores = await fetchAndParseMessages(channelId, guildId, new Set(), messageLimit);
         console.log(`[Sync] Parsed results for ${Object.keys(channelScores).length} days`);
         
         if (Object.keys(channelScores).length === 0) {

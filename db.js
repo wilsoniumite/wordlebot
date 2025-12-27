@@ -9,9 +9,63 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Hash function for user IDs
-export function hashUserId(userId) {
+// Hash function for user IDs (kept for migration purposes)
+function hashUserId(userId) {
   return crypto.createHash('sha256').update(userId.toString()).digest('hex');
+}
+
+// Check if a value is a hash (64 hex chars) vs a Discord snowflake (17-19 digits)
+function isHashedUserId(value) {
+  // Hashed IDs are 64 character hex strings (contains letters a-f)
+  // Discord snowflakes are 17-19 digit numbers (only digits)
+  return value && value.length === 64 && /[a-f]/.test(value);
+}
+
+// Migration helper: Update all rows with hashed user_id to plain user_id
+async function migrateUserIdFromHash(client, userId) {
+  const userIdHash = hashUserId(userId);
+  
+  // Check if any rows exist with this hash
+  const checkResult = await client.query(
+    'SELECT COUNT(*) as count FROM wordle_results WHERE user_id_hash = $1',
+    [userIdHash]
+  );
+  
+  const count = parseInt(checkResult.rows[0].count);
+  if (count === 0) {
+    return 0; // No rows to migrate
+  }
+  
+  console.log(`[Migration] Found ${count} rows with hashed ID for user ${userId}, migrating...`);
+  
+  // Update all rows from hash to plain ID
+  // We need to handle conflicts carefully - if the plain ID already exists, keep it
+  const result = await client.query(`
+    UPDATE wordle_results
+    SET user_id_hash = $1
+    WHERE user_id_hash = $2
+      AND NOT EXISTS (
+        SELECT 1 FROM wordle_results wr2 
+        WHERE wr2.user_id_hash = $1 
+          AND wr2.wordle_number = wordle_results.wordle_number
+          AND wr2.channel_id = wordle_results.channel_id
+      )
+  `, [userId.toString(), userIdHash]);
+  
+  const updated = result.rowCount;
+  console.log(`[Migration] Migrated ${updated} rows from hash to plain ID for user ${userId}`);
+  
+  // Clean up any remaining hashed rows (these are duplicates)
+  const deleteResult = await client.query(
+    'DELETE FROM wordle_results WHERE user_id_hash = $1',
+    [userIdHash]
+  );
+  
+  if (deleteResult.rowCount > 0) {
+    console.log(`[Migration] Removed ${deleteResult.rowCount} duplicate hashed rows for user ${userId}`);
+  }
+  
+  return updated;
 }
 
 // Save wordle results to database
@@ -27,6 +81,15 @@ export async function saveWordleResults(scores, channelId) {
   
   try {
     await client.query('BEGIN');
+    
+    // First, check if any users need migration
+    const userIds = [...new Set(
+      Object.values(scores).flat().map(entry => entry.userId)
+    )];
+    
+    for (const userId of userIds) {
+      await migrateUserIdFromHash(client, userId);
+    }
     
     const insertQuery = `
       INSERT INTO wordle_results (user_id_hash, wordle_number, completed_at, score, channel_id, message_id)
@@ -47,10 +110,8 @@ export async function saveWordleResults(scores, channelId) {
       const completedAt = new Date(); // Use current timestamp
       
       for (const entry of dayResults) {
-        const userIdHash = hashUserId(entry.userId);
-        
         const result = await client.query(insertQuery, [
-          userIdHash,
+          entry.userId.toString(), // Store user ID as plain string (not hashed)
           parseInt(wordleNumber),
           completedAt,
           entry.score,
@@ -108,9 +169,13 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
     
     // Filter by user IDs if provided
     if (userIds && userIds.length > 0) {
+      // Build OR condition for both plain IDs and their hashes
+      const userIdStrings = userIds.map(id => id.toString());
       const userIdHashes = userIds.map(id => hashUserId(id));
+      const allPossibleIds = [...userIdStrings, ...userIdHashes];
+      
       query += ` AND user_id_hash = ANY($${paramCount})`;
-      params.push(userIdHashes);
+      params.push(allPossibleIds);
       paramCount++;
     }
     
@@ -133,14 +198,6 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
     
     // Convert to the format needed by calculateLeaderboard
     const scores = {};
-    const hashToUserId = {};
-    
-    // Build reverse mapping if userIds were provided
-    if (userIds && userIds.length > 0) {
-      for (const userId of userIds) {
-        hashToUserId[hashUserId(userId)] = userId;
-      }
-    }
     
     for (const row of result.rows) {
       const wordleNumber = row.wordle_number.toString();
@@ -149,15 +206,15 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
         scores[wordleNumber] = [];
       }
       
-      // Use the original userId if we have it in the mapping, otherwise use the hash
-      const userId = hashToUserId[row.user_id_hash] || row.user_id_hash;
-      
-      // Return in object format { userId, score, channelId }
-      // channelId is needed for deduplication
+      // Return in object format { userId, score, channelId, messageId }
+      // If the user_id_hash is actually a hash, we'll keep it for now
+      // (it will be migrated on next save)
       scores[wordleNumber].push({ 
-        userId, 
+        userId: row.user_id_hash,
         score: row.score,
-        channelId: row.channel_id 
+        channelId: row.channel_id,
+        messageId: row.message_id,
+        isHashed: isHashedUserId(row.user_id_hash) // Flag for debugging
       });
     }
     
@@ -173,9 +230,9 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
   }
 }
 
-// Get all unique user ID hashes in the database
+// Get all unique user IDs in the database (both plain and hashed)
 // channelId: optional filter by specific channel
-export async function getAllUserIdHashes(channelId = null) {
+export async function getAllUserIds(channelId = null) {
   const client = await pool.connect();
   
   try {
@@ -191,7 +248,7 @@ export async function getAllUserIdHashes(channelId = null) {
     
     return result.rows.map(row => row.user_id_hash);
   } catch (error) {
-    console.error('Error getting user ID hashes:', error);
+    console.error('Error getting user IDs:', error);
     throw error;
   } finally {
     client.release();
@@ -199,13 +256,14 @@ export async function getAllUserIdHashes(channelId = null) {
 }
 
 // Get detailed statistics for a specific user
-// Deduplicates by (user_id_hash, wordle_number) using channel priority
+// Deduplicates by (user_id, wordle_number) using channel priority
 // channelId: optional preferred channel for deduplication (null = use lowest non-zero, then 0)
 export async function getUserStats(userId, channelId = null) {
   const client = await pool.connect();
   
   try {
-    const userIdHash = hashUserId(userId);
+    // First, try to migrate this user's data if it exists as hashed
+    await migrateUserIdFromHash(client, userId);
     
     // Use DISTINCT ON to pick one row per wordle_number based on priority
     // Priority: 1) channelId (if provided), 2) lowest non-zero channel_id, 3) channel_id 0
@@ -251,7 +309,7 @@ export async function getUserStats(userId, channelId = null) {
         channel_id
     `;
     
-    const params = channelId !== null ? [userIdHash, channelId.toString()] : [userIdHash];
+    const params = channelId !== null ? [userId.toString(), channelId.toString()] : [userId.toString()];
     
     // Get deduplicated games for this user
     const deduplicatedGames = await client.query(

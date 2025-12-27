@@ -151,66 +151,39 @@ async function handleRateLimitHeaders(response, context = '') {
   }
 }
 
-// Function to fetch channel messages with rate limiting
-export async function fetchChannelMessages(channelId, limit = 100) {
-  const messages = [];
-  let before = null;
+// Fetch a single batch of messages from Discord
+async function fetchMessageBatch(channelId, before) {
+  const url = `https://discord.com/api/v10/channels/${channelId}/messages?limit=100${before ? `&before=${before}` : ''}`;
   
-  while (messages.length < limit) {
-    const url = `https://discord.com/api/v10/channels/${channelId}/messages?limit=100${before ? `&before=${before}` : ''}`;
+  let retries = 0;
+  const maxRetries = 3;
+  
+  while (retries <= maxRetries) {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    });
     
-    let retries = 0;
-    const maxRetries = 3;
-    let response;
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('retry-after');
+      const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : Math.pow(2, retries) * 1000;
+      console.log(`Rate limited. Waiting ${waitTime}ms before retry ${retries + 1}/${maxRetries}`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      retries++;
+      continue;
+    }
     
-    // Retry loop for handling rate limits
-    while (retries <= maxRetries) {
-      response = await fetch(url, {
-        headers: {
-          Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (response.status === 429) {
-        const retryAfter = response.headers.get('retry-after');
-        const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : Math.pow(2, retries) * 1000;
-        
-        console.log(`Rate limited. Waiting ${waitTime}ms before retry ${retries + 1}/${maxRetries}`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        retries++;
-        continue;
-      }
-      
-      if (!response.ok) {
-        throw new Error(`Failed to fetch messages: ${response.status} ${response.statusText}`);
-      }
+    if (!response.ok) {
+      throw new Error(`Failed to fetch messages: ${response.status} ${response.statusText}`);
+    }
 
-      // Check rate limit headers
-      await handleRateLimitHeaders(response, 'fetchChannelMessages');
-      
-      // Success - break out of retry loop
-      break;
-    }
-    
-    if (retries > maxRetries) {
-      throw new Error('Max retries exceeded for fetching messages');
-    }
-    
-    const batch = await response.json();
-    if (batch.length === 0) break;
-    
-    messages.push(...batch);
-    before = batch[batch.length - 1].id;
-    
-    if (batch.length < 100) break; // No more messages
-    
-    // Add a small delay between requests to avoid rate limiting
-    // Discord recommends spacing out requests
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await handleRateLimitHeaders(response, 'fetchMessageBatch');
+    return await response.json();
   }
   
-  return messages;
+  throw new Error('Max retries exceeded for fetching messages');
 }
 
 // Function to fetch user info from Discord API
@@ -475,12 +448,8 @@ async function extractWordleNumber(imageUrl) {
   }
 }
 
-// Parse Wordle results from Discord messages
-// Returns: { wordleNumber: [{ userId, score, messageId }, ...] }
-export async function parseWordleResults(messages, guildId) {
-  // Build username to ID mapping from guild members
-  const { usernameToUserId } = await buildUsernameMapping(guildId);
-  
+// Parse a batch of messages for Wordle results
+async function parseWordleResultsBatch(messages, usernameToUserId) {
   const scores = {};
   
   for (const message of messages) {
@@ -558,6 +527,113 @@ export async function parseWordleResults(messages, guildId) {
     }
   }
   return scores;
+}
+
+// Unified function to fetch and parse messages with parallel processing
+// Features:
+// - Always does parallel fetch + OCR for performance
+// - Optional early termination when existingMessageIds is provided
+// - Used by both /sync (no early termination) and leaderboard (with early termination)
+//
+// Parameters:
+// - channelId: Discord channel to fetch from
+// - guildId: Guild ID for username mapping
+// - existingMessageIds: Set of message IDs already in DB (pass null/empty Set for no early termination)
+// - limit: Maximum messages to fetch
+//
+// Returns: { wordleNumber: [{ userId, score, messageId }, ...] }
+export async function fetchAndParseMessages(channelId, guildId, existingMessageIds = null, limit = 1000) {
+  const allScores = {};
+  let totalMessages = 0;
+  let before = null;
+  
+  // Build username mapping once at the start
+  console.log('[FetchParse] Building username mapping...');
+  const { usernameToUserId } = await buildUsernameMapping(guildId);
+  
+  // Normalize existingMessageIds (could be null, undefined, or empty Set)
+  const messageIdSet = existingMessageIds || new Set();
+  const checkForEarlyTermination = messageIdSet.size > 0;
+  
+  if (checkForEarlyTermination) {
+    console.log(`[FetchParse] Early termination enabled: ${messageIdSet.size} existing message IDs`);
+  } else {
+    console.log('[FetchParse] Early termination disabled: fetching all messages');
+  }
+  
+  // Fetch first batch
+  console.log('[FetchParse] Fetching first batch...');
+  let currentBatch = await fetchMessageBatch(channelId, before);
+  
+  while (currentBatch && currentBatch.length > 0 && totalMessages < limit) {
+    totalMessages += currentBatch.length;
+    console.log(`[FetchParse] Processing batch of ${currentBatch.length} messages (total: ${totalMessages})`);
+    
+    // Check if we hit any existing messages in this batch (only if early termination is enabled)
+    let firstExistingIndex = -1;
+    if (checkForEarlyTermination) {
+      firstExistingIndex = currentBatch.findIndex(msg => messageIdSet.has(msg.id));
+      
+      if (firstExistingIndex !== -1) {
+        console.log(`[FetchParse] Found existing message at index ${firstExistingIndex}, stopping fetch`);
+        // Only process messages before the first existing one
+        const newMessages = currentBatch.slice(0, firstExistingIndex);
+        
+        if (newMessages.length > 0) {
+          console.log(`[FetchParse] Processing final ${newMessages.length} new messages...`);
+          const batchScores = await parseWordleResultsBatch(newMessages, usernameToUserId);
+          Object.assign(allScores, batchScores);
+        }
+        
+        console.log('[FetchParse] Early termination - all older messages assumed in DB');
+        break; // Stop processing
+      }
+    }
+    
+    // All messages in this batch are new (or we're not checking)
+    // Update before for potential next iteration
+    before = currentBatch[currentBatch.length - 1].id;
+    
+    // Start fetching next batch if this batch was full (might be more messages)
+    let nextBatchPromise = null;
+    if (currentBatch.length === 100 && totalMessages < limit) {
+      // Wrap the fetch with a delay so it happens during OCR processing
+      nextBatchPromise = (async () => {
+        // Small delay to be respectful to Discord API
+        await new Promise(resolve => setTimeout(resolve, 500));
+        return await fetchMessageBatch(channelId, before);
+      })();
+    }
+    
+    // Process current batch (OCR happens here) - runs in parallel with next fetch (including its delay)
+    const parsePromise = parseWordleResultsBatch(currentBatch, usernameToUserId);
+    
+    // Wait for both to complete (delay in fetch happens during OCR - efficient!)
+    const [batchScores, nextBatch] = await Promise.all([
+      parsePromise,
+      nextBatchPromise || Promise.resolve(null)
+    ]);
+    
+    console.log(`[FetchParse] Found ${Object.keys(batchScores).length} Wordle days in this batch`);
+    Object.assign(allScores, batchScores);
+    
+    // Move to next batch
+    currentBatch = nextBatch;
+    
+    // If we got a partial batch, we're done
+    if (nextBatch && nextBatch.length < 100) {
+      console.log('[FetchParse] Received partial batch, no more messages available');
+      
+      // Process this final batch
+      const finalBatchScores = await parseWordleResultsBatch(nextBatch, usernameToUserId);
+      Object.assign(allScores, finalBatchScores);
+      totalMessages += nextBatch.length;
+      break;
+    }
+  }
+  
+  console.log(`[FetchParse] Completed. Fetched ${totalMessages} messages, found ${Object.keys(allScores).length} Wordle days`);
+  return allScores;
 }
 
 // Function to calculate leaderboard

@@ -37,30 +37,31 @@ async function DiscordRequest(endpoint, options) {
   return res;
 }
 
-// Simple test command
-const TEST_COMMAND = {
-  name: 'test',
-  description: 'Basic command to test if the bot is working',
+// Help command - works in servers and bot DMs (NOT group DMs)
+const HELP_COMMAND = {
+  name: 'help',
+  description: 'Learn how to use the Wordle Stats Bot',
   type: 1,
-  integration_types: [0, 1],
-  contexts: [0, 1, 2],
+  integration_types: [0, 1], // Guild and User install
+  contexts: [0, 1, 2], // Guild and Bot DM only (no group DMs)
 };
 
+// Personal stats - works in servers and bot DMs (NOT group DMs)
 const PERSONAL_STATS_COMMAND = {
   name: 'personal_stats',
   description: 'View your personal Wordle statistics',
   type: 1,
-  integration_types: [0, 1],
-  contexts: [0, 1, 2],
+  integration_types: [0, 1], // Guild and User install
+  contexts: [0, 1, 2], // Guild and Bot DM only (no group DMs)
 };
 
-// Sync command to update database without showing leaderboard
+// Sync command - GUILD ONLY (needs channel message access)
 const SYNC_COMMAND = {
   name: 'sync',
   description: 'Read channel messages and update database (no leaderboard shown)',
   type: 1,
-  integration_types: [0, 1],
-  contexts: [0, 1, 2],
+  integration_types: [0], // Guild install only
+  contexts: [0], // Guild channels only
   options: [
     {
       name: 'message_limit',
@@ -73,13 +74,13 @@ const SYNC_COMMAND = {
   ]
 };
 
-// Elo-based leaderboard command
+// Elo-based leaderboard command - GUILD ONLY (meant for sharing in servers)
 const ELO_LEADERBOARD_COMMAND = {
   name: 'elo_leaderboard',
   description: 'Generate Wordle leaderboard using Elo ratings',
   type: 1,
-  integration_types: [0, 1],
-  contexts: [0, 1, 2],
+  integration_types: [0], // Guild install only
+  contexts: [0], // Guild channels only
   options: [
     {
       name: 'channel_only',
@@ -128,13 +129,13 @@ const ELO_LEADERBOARD_COMMAND = {
   ]
 };
 
-// Average-based leaderboard command
+// Average-based leaderboard command - GUILD ONLY (meant for sharing in servers)
 const AVERAGE_LEADERBOARD_COMMAND = {
   name: 'average_leaderboard',
   description: 'Generate Wordle leaderboard using average scores',
   type: 1,
-  integration_types: [0, 1],
-  contexts: [0, 1, 2],
+  integration_types: [0], // Guild install only
+  contexts: [0], // Guild channels only
   options: [
     {
       name: 'channel_only',
@@ -172,7 +173,7 @@ const AVERAGE_LEADERBOARD_COMMAND = {
 };
 
 const ALL_COMMANDS = [
-  TEST_COMMAND, 
+  HELP_COMMAND,
   PERSONAL_STATS_COMMAND, 
   SYNC_COMMAND, 
   ELO_LEADERBOARD_COMMAND,

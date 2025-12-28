@@ -192,6 +192,35 @@ async function generateLeaderboard(req, res, statsMethod) {
     const xIsSeven = optionsMap.x_is_seven || false;
     scores = filterScores(scores, xIsSeven);
     console.log(`[Leaderboard] After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
+
+    // IMPORTANT: Filter out hashed user IDs before processing
+    // Hashed IDs cause duplicate users and failed username fetches
+    // They'll be migrated on next save operation
+    let hashedEntriesRemoved = 0;
+    const scoresWithoutHashes = {};
+    
+    for (const [wordleNumber, dayResults] of Object.entries(scores)) {
+      const filteredResults = dayResults.filter(entry => {
+        const isHashed = entry.userId && entry.userId.length === 64 && /[a-f]/.test(entry.userId);
+        if (isHashed) {
+          hashedEntriesRemoved++;
+          return false; // Filter out hashed entries
+        }
+        return true;
+      });
+      
+      if (filteredResults.length > 0) {
+        scoresWithoutHashes[wordleNumber] = filteredResults;
+      }
+    }
+    
+    scores = scoresWithoutHashes;
+    
+    if (hashedEntriesRemoved > 0) {
+      console.log(`[Leaderboard] Filtered out ${hashedEntriesRemoved} hashed entries (will be migrated on next save)`);
+    }
+    
+    console.log(`[Leaderboard] Using ${Object.keys(scores).length} days for leaderboard calculation`);
     
     // Deduplicate scores (same user + wordle number in different channels)
     // Priority: current channel, then lowest non-zero channel, then legacy (0)

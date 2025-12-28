@@ -13,6 +13,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ./scripts:/usr/src/bot/scripts
     networks:
       - bot-network
 

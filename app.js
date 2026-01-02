@@ -27,61 +27,20 @@ import {
   getUserStats
 } from './db.js';
 
-const UMAMI_URL = process.env.UMAMI_URL;
-const UMAMI_WEBSITE_ID = process.env.UMAMI_WEBSITE_ID;
-
+import { logger, httpLogger } from './logger.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-async function trackEvent(event, data = {}) {
-  if (!UMAMI_URL || !UMAMI_WEBSITE_ID) return;
+// Add HTTP logging middleware
+app.use('/interactions', httpLogger);
 
-  try {
-    const response = await fetch(`${UMAMI_URL}/api/send`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      body: JSON.stringify({
-        payload: {
-          hostname: 'discord-bot',
-          language: 'en-US',
-          referrer: '',
-          screen: '1920x1080',
-          title: event,
-          url: `/interactions/${event}`,
-          website: UMAMI_WEBSITE_ID,
-          name: event,
-          data: data
-        },
-        type: 'event'
-      })
-    });
-  } catch (err) {
-    console.error('Umami tracking error:', err.message);
-  }
-}
-
-app.use('/interactions', (req, res, next) => {
-  let tracked = false;
-
-  res.on('finish', () => {
-    if (!tracked && req.body?.data?.name) {
-      tracked = true;
-      trackEvent(req.body.data.name, {
-        guild: req.body?.guild_id,
-        user: req.body?.member?.user?.id || req.body?.user?.id
-      });
-    }
-  });
-
-  next();
-});
 
 // Shared leaderboard generation function - OPTIMIZED VERSION
 async function generateLeaderboard(req, res, statsMethod) {
+  // Create child logger for this request
+  const log = req.log.child({ function: 'generateLeaderboard', statsMethod });
+  
   try {
     const { options } = req.body.data;
 
@@ -97,6 +56,8 @@ async function generateLeaderboard(req, res, statsMethod) {
     const guildId = req.body.guild_id;
     const channelOnly = optionsMap.channel_only || false;
 
+    log.info({ channelId, guildId, channelOnly, options: optionsMap }, 'Starting leaderboard generation');
+
     // Send initial ephemeral response
     res.send({
       type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -106,9 +67,9 @@ async function generateLeaderboard(req, res, statsMethod) {
     });
 
     // OPTIMIZATION: First, get existing data from DB for this channel
-    console.log('[Leaderboard] Fetching existing data from DB for channel', channelId);
-    const existingScores = await getWordleResults(null, null, null, channelId);
-    console.log(`[Leaderboard] Found ${Object.keys(existingScores).length} days in DB for this channel`);
+    log.debug({ channelId }, 'Fetching existing data from DB');
+    const existingScores = await getWordleResults(null, null, null, channelId, log);
+    log.info({ daysCount: Object.keys(existingScores).length }, 'Found days in DB for this channel');
 
     // Check for hashed user IDs and collect message IDs in a single pass
     let hasHashedUsers = false;
@@ -132,12 +93,15 @@ async function generateLeaderboard(req, res, statsMethod) {
       if (hasHashedUsers) break;
     }
 
-    console.log(`[Leaderboard] ${hasHashedUsers ? 'Hashed users detected - disabling early termination' : `Found ${existingMessageIds.size} message IDs for early termination`}`);
+    log.debug({ 
+      hasHashedUsers, 
+      existingMessageIdsCount: existingMessageIds.size 
+    }, 'Checked for hashed users and existing message IDs');
 
     // OPTIMIZATION: Use optimized fetch with early termination and parallel processing
-    console.log('[Leaderboard] Fetching messages with parallel processing...');
-    const newScores = await fetchAndParseMessages(channelId, guildId, existingMessageIds, 1000);
-    console.log(`[Leaderboard] Found ${Object.keys(newScores).length} new days from Discord`);
+    log.info('Fetching messages with parallel processing');
+    const newScores = await fetchAndParseMessages(channelId, guildId, existingMessageIds, 1000, log);
+    log.info({ newDaysCount: Object.keys(newScores).length }, 'Found new days from Discord');
 
     // Merge new scores with existing scores
     const channelScores = { ...existingScores };
@@ -149,9 +113,10 @@ async function generateLeaderboard(req, res, statsMethod) {
         channelScores[wordleNumber] = dayResults;
       }
     }
-    console.log(`[Leaderboard] Total data: ${Object.keys(channelScores).length} days after merge`);
+    log.info({ totalDays: Object.keys(channelScores).length }, 'Total data after merge');
 
     if (Object.keys(channelScores).length === 0) {
+      log.warn('No Wordle results found in channel');
       return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -163,39 +128,37 @@ async function generateLeaderboard(req, res, statsMethod) {
 
     // Save NEW results to database (only if we found new data)
     if (Object.keys(newScores).length > 0) {
-      console.log('[Leaderboard] Saving new results to database...');
-      const saveResult = await saveWordleResults(newScores, channelId);
-      console.log(`[Leaderboard] Saved ${saveResult.total} results to database (${saveResult.new} new, ${saveResult.updated} updated)`);
+      log.info('Saving new results to database');
+      const saveResult = await saveWordleResults(newScores, channelId, log);
+      log.info(saveResult, 'Saved results to database');
     } else {
-      console.log('[Leaderboard] No new results to save - all data was in DB already');
+      log.debug('No new results to save - all data was in DB already');
     }
 
     // Determine which data to use for leaderboard
     let scores;
     if (channelOnly) {
-      console.log('[Leaderboard] Using channel-only data for leaderboard');
+      log.debug('Using channel-only data for leaderboard');
       scores = channelScores;
     } else {
-      console.log('[Leaderboard] Fetching all data from database for leaderboard');
+      log.debug('Fetching all data from database for leaderboard');
       // Get all user IDs from channel to maintain the userId (not hash) in results
       const channelUserIds = [...new Set(
         Object.values(channelScores).flat().map(entry => entry.userId)
       )];
 
       // Fetch all data from database for these users (all channels)
-      scores = await getWordleResults(channelUserIds);
+      scores = await getWordleResults(channelUserIds, null, null, null, log);
 
-      console.log(`[Leaderboard] Using database data: ${Object.keys(scores).length} days`);
+      log.info({ daysCount: Object.keys(scores).length }, 'Using database data');
     }
 
     // Filter out score 7 (X/failed) if xIsSeven is false
     const xIsSeven = optionsMap.x_is_seven || false;
     scores = filterScores(scores, xIsSeven);
-    console.log(`[Leaderboard] After filtering (xIsSeven=${xIsSeven}): ${Object.keys(scores).length} days`);
+    log.debug({ xIsSeven, daysCount: Object.keys(scores).length }, 'After filtering');
 
     // IMPORTANT: Filter out hashed user IDs before processing
-    // Hashed IDs cause duplicate users and failed username fetches
-    // They'll be migrated on next save operation
     let hashedEntriesRemoved = 0;
     const scoresWithoutHashes = {};
 
@@ -204,7 +167,7 @@ async function generateLeaderboard(req, res, statsMethod) {
         const isHashed = entry.userId && entry.userId.length === 64 && /[a-f]/.test(entry.userId);
         if (isHashed) {
           hashedEntriesRemoved++;
-          return false; // Filter out hashed entries
+          return false;
         }
         return true;
       });
@@ -217,28 +180,26 @@ async function generateLeaderboard(req, res, statsMethod) {
     scores = scoresWithoutHashes;
 
     if (hashedEntriesRemoved > 0) {
-      console.log(`[Leaderboard] Filtered out ${hashedEntriesRemoved} hashed entries (will be migrated on next save)`);
+      log.info({ hashedEntriesRemoved }, 'Filtered out hashed entries');
     }
 
-    console.log(`[Leaderboard] Using ${Object.keys(scores).length} days for leaderboard calculation`);
+    log.debug({ daysCount: Object.keys(scores).length }, 'Using days for leaderboard calculation');
 
     // Deduplicate scores (same user + wordle number in different channels)
-    // Priority: current channel, then lowest non-zero channel, then legacy (0)
     scores = deduplicateScores(scores, channelId);
-    console.log(`[Leaderboard] After deduplication: ${Object.keys(scores).length} days`);
+    log.debug({ daysCount: Object.keys(scores).length }, 'After deduplication');
 
     // Get all unique user IDs and fetch their usernames
     const allUserIds = [...new Set(
       Object.values(scores).flat().map(entry => entry.userId)
     )];
 
-    console.log(`[Leaderboard] Fetching usernames for ${allUserIds.length} users`);
+    log.info({ userCount: allUserIds.length }, 'Fetching usernames');
     const userIdToUsername = {};
 
     // Fetch usernames sequentially with small delays
-    // The retry logic in fetchUserInfo will handle any rate limits
     for (const userId of allUserIds) {
-      const username = await fetchUserInfo(userId);
+      const username = await fetchUserInfo(userId, log);
       userIdToUsername[userId] = username;
 
       // Small delay between requests to be respectful
@@ -255,7 +216,7 @@ async function generateLeaderboard(req, res, statsMethod) {
       bayesAdjustment: optionsMap.bayes_adjustment !== false
     };
 
-    console.log('[Leaderboard] Calculating leaderboard...');
+    log.info({ options: leaderboardOptions }, 'Calculating leaderboard');
     const leaderboard = calculateLeaderboard(scores, leaderboardOptions);
 
     // Convert user IDs to usernames in the leaderboard
@@ -265,7 +226,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     }));
 
     // Generate SVG
-    console.log('[Leaderboard] Generating SVG leaderboard...');
+    log.debug('Generating SVG leaderboard');
     const dataSource = channelOnly ? ' (Channel Only)' : ' (All Channels)';
     const svgContent = generateLeaderboardSVG(
       leaderboardWithUsernames,
@@ -274,7 +235,7 @@ async function generateLeaderboard(req, res, statsMethod) {
     );
 
     // Convert SVG to PNG using sharp
-    console.log('[Leaderboard] Converting SVG to PNG...');
+    log.debug('Converting SVG to PNG');
     const pngBuffer = await sharp(Buffer.from(svgContent))
       .png()
       .toBuffer();
@@ -310,9 +271,10 @@ async function generateLeaderboard(req, res, statsMethod) {
       body: formData
     });
 
+    log.info('Leaderboard generation completed successfully');
+
   } catch (error) {
-    console.error('[Leaderboard] Error generating leaderboard:', error);
-    console.error(error.stack);
+    log.error({ err: error, stack: error.stack }, 'Error generating leaderboard');
     await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -326,6 +288,15 @@ async function generateLeaderboard(req, res, statsMethod) {
 app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async function (req, res) {
   const { id, type, data } = req.body;
 
+  req.log = req.log.child({
+    interactionId: id,
+    guildId: req.body?.guild_id,
+    channelId: req.body?.channel_id,
+    userId: req.body?.member?.user?.id || req.body?.user?.id,
+    command: req.body?.data?.name,
+    interactionType: type,
+  });
+
   if (type === InteractionType.PING) {
     return res.send({ type: InteractionResponseType.PONG });
   }
@@ -334,16 +305,20 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
     const { custom_id } = data;
 
     if (custom_id === 'publish_leaderboard') {
+      const log = req.log.child({ function: 'publishLeaderboard' });
+      
       try {
         // Get the attachment from the ephemeral message
         const message = req.body.message;
         const attachment = message?.attachments?.[0];
 
-        console.log('[Publish] Message:', message ? 'found' : 'not found');
-        console.log('[Publish] Attachments:', message?.attachments?.length || 0);
+        log.debug({ 
+          hasMessage: !!message, 
+          attachmentCount: message?.attachments?.length || 0 
+        }, 'Checking for attachment');
 
         if (!attachment) {
-          console.error('[Publish] No attachment found. Message structure:', JSON.stringify(message, null, 2));
+          log.error({ message }, 'No attachment found');
           return res.send({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
             data: {
@@ -353,7 +328,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           });
         }
 
-        console.log('[Publish] Found attachment:', attachment.filename || attachment.id);
+        log.debug({ filename: attachment.filename || attachment.id }, 'Found attachment');
 
         // Send deferred response
         res.send({
@@ -361,7 +336,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         });
 
         // Fetch the image from the attachment URL
-        console.log('[Publish] Fetching image from URL:', attachment.url);
+        log.debug({ url: attachment.url }, 'Fetching image');
         const imageResponse = await fetch(attachment.url);
         const imageBuffer = await imageResponse.arrayBuffer();
 
@@ -376,7 +351,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         }));
 
         // Post to channel
-        console.log('[Publish] Posting leaderboard to channel:', req.body.channel_id);
+        log.info({ channelId: req.body.channel_id }, 'Posting leaderboard to channel');
         await fetch(`https://discord.com/api/v10/channels/${req.body.channel_id}/messages`, {
           method: 'POST',
           headers: {
@@ -385,7 +360,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           body: formData
         });
 
-        console.log('[Publish] Successfully posted to channel');
+        log.info('Successfully posted to channel');
 
         // Update the ephemeral message to show it was published
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
@@ -398,8 +373,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         });
 
       } catch (error) {
-        console.error('[Publish] Error publishing leaderboard:', error);
-        console.error('[Publish] Stack trace:', error.stack);
+        log.error({ err: error, stack: error.stack }, 'Error publishing leaderboard');
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -466,6 +440,8 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
     }
 
     if (name === 'sync') {
+      const log = req.log.child({ function: 'sync' });
+      
       try {
         // Parse options
         const optionsMap = {};
@@ -479,6 +455,8 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         const guildId = req.body.guild_id;
         const messageLimit = optionsMap.message_limit || 1000;
 
+        log.info({ channelId, guildId, messageLimit }, 'Starting sync');
+
         // Send initial ephemeral response
         res.send({
           type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -489,11 +467,12 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
 
         // Fetch and parse messages with parallel processing
         // Pass empty Set for existingMessageIds to disable early termination
-        console.log(`[Sync] Fetching up to ${messageLimit} messages from channel ${channelId}`);
-        const channelScores = await fetchAndParseMessages(channelId, guildId, new Set(), messageLimit);
-        console.log(`[Sync] Parsed results for ${Object.keys(channelScores).length} days`);
+        log.info({ messageLimit }, 'Fetching messages');
+        const channelScores = await fetchAndParseMessages(channelId, guildId, new Set(), messageLimit, log);
+        log.info({ daysCount: Object.keys(channelScores).length }, 'Parsed results');
 
         if (Object.keys(channelScores).length === 0) {
+          log.info('No Wordle results found in channel');
           return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
@@ -510,9 +489,11 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           Object.values(channelScores).flat().map(entry => entry.userId)
         ).size;
 
+        log.info({ totalPuzzles, totalGames, uniqueUsers }, 'Sync statistics');
+
         // Save to database with channel ID and message IDs
-        console.log('[Sync] Saving results to database...');
-        const saveResult = await saveWordleResults(channelScores, channelId);
+        log.info('Saving results to database');
+        const saveResult = await saveWordleResults(channelScores, channelId, log);
 
         // Send success message (ephemeral)
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
@@ -528,9 +509,10 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
           })
         });
 
+        log.info('Sync completed successfully');
+
       } catch (error) {
-        console.error('[Sync] Error syncing data:', error);
-        console.error(error.stack);
+        log.error({ err: error, stack: error.stack }, 'Error syncing data');
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -543,12 +525,15 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
     }
 
     if (name === 'personal_stats') {
+      const log = req.log.child({ function: 'personalStats' });
+      
       try {
         // Get the user ID from the interaction
         const userId = req.body.member?.user?.id || req.body.user?.id;
         const channelId = req.body.channel_id;
 
         if (!userId) {
+          log.warn('Could not identify user');
           return res.send({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
             data: {
@@ -557,6 +542,8 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
             }
           });
         }
+
+        log.info({ userId, channelId }, 'Fetching personal stats');
 
         // Send initial ephemeral response
         res.send({
@@ -567,11 +554,10 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         });
 
         // Get user stats from database
-        // Pass channelId for channel-aware deduplication
-        console.log(`[PersonalStats] Fetching stats for user ${userId} in channel ${channelId}`);
-        const stats = await getUserStats(userId, channelId);
+        const stats = await getUserStats(userId, channelId, log);
 
         if (stats.totalGames === 0) {
+          log.info('No games found for user');
           return await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
@@ -583,7 +569,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         }
 
         // Format the stats message
-        const username = await fetchUserInfo(userId);
+        const username = await fetchUserInfo(userId, log);
         let message = `📊 **Wordle Statistics for ${username}**\n\n`;
 
         // Overall stats
@@ -623,6 +609,8 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         message += `├ First: Wordle #${stats.firstWordle}\n`;
         message += `└ Latest: Wordle #${stats.lastWordle}\n`;
 
+        log.info({ totalGames: stats.totalGames, avgScore: stats.avgScore }, 'Personal stats retrieved');
+
         // Send the stats (ephemeral)
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
@@ -633,8 +621,7 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
         });
 
       } catch (error) {
-        console.error('[PersonalStats] Error fetching personal stats:', error);
-        console.error(error.stack);
+        log.error({ err: error, stack: error.stack }, 'Error fetching personal stats');
         await fetch(`https://discord.com/api/v10/webhooks/${req.body.application_id}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -656,14 +643,14 @@ app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async fun
       return;
     }
 
-    console.error(`unknown command: ${name}`);
+    logger.error({ command: name }, 'Unknown command');
     return res.status(400).json({ error: 'unknown command' });
   }
 
-  console.error('unknown interaction type', type);
+  logger.error({ interactionType: type }, 'Unknown interaction type');
   return res.status(400).json({ error: 'unknown interaction type' });
 });
 
 app.listen(PORT, () => {
-  console.log('Listening on port', PORT);
+  logger.info({ port: PORT }, 'Server started');
 });

@@ -6,7 +6,9 @@ const { Pool } = pg;
 // Create a connection pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: process.env.DATABASE_SSL === 'true' 
+    ? { rejectUnauthorized: false } 
+    : false
 });
 
 // Hash function for user IDs (kept for migration purposes)
@@ -22,7 +24,7 @@ function isHashedUserId(value) {
 }
 
 // Migration helper: Update all rows with hashed user_id to plain user_id
-async function migrateUserIdFromHash(client, userId) {
+async function migrateUserIdFromHash(client, userId, logger) {
   const userIdHash = hashUserId(userId);
   
   // Check if any rows exist with this hash
@@ -36,7 +38,9 @@ async function migrateUserIdFromHash(client, userId) {
     return 0; // No rows to migrate
   }
   
-  console.log(`[Migration] Found ${count} rows with hashed ID for user ${userId}, migrating...`);
+  if (logger) {
+    logger.info({ userId, count }, 'Found rows with hashed ID, migrating');
+  }
   
   // Update all rows from hash to plain ID
   // We need to handle conflicts carefully - if the plain ID already exists, keep it
@@ -53,7 +57,9 @@ async function migrateUserIdFromHash(client, userId) {
   `, [userId.toString(), userIdHash]);
   
   const updated = result.rowCount;
-  console.log(`[Migration] Migrated ${updated} rows from hash to plain ID for user ${userId}`);
+  if (logger) {
+    logger.info({ userId, updated }, 'Migrated rows from hash to plain ID');
+  }
   
   // Clean up any remaining hashed rows (these are duplicates)
   const deleteResult = await client.query(
@@ -61,8 +67,8 @@ async function migrateUserIdFromHash(client, userId) {
     [userIdHash]
   );
   
-  if (deleteResult.rowCount > 0) {
-    console.log(`[Migration] Removed ${deleteResult.rowCount} duplicate hashed rows for user ${userId}`);
+  if (deleteResult.rowCount > 0 && logger) {
+    logger.info({ userId, removed: deleteResult.rowCount }, 'Removed duplicate hashed rows');
   }
   
   return updated;
@@ -76,7 +82,8 @@ async function migrateUserIdFromHash(client, userId) {
 //   ]
 // }
 // channelId: Discord channel snowflake ID (string or number)
-export async function saveWordleResults(scores, channelId) {
+export async function saveWordleResults(scores, channelId, logger) {
+  const log = logger ? logger.child({ function: 'saveWordleResults', channelId }) : null;
   const client = await pool.connect();
   
   try {
@@ -87,8 +94,12 @@ export async function saveWordleResults(scores, channelId) {
       Object.values(scores).flat().map(entry => entry.userId)
     )];
     
+    if (log) {
+      log.debug({ userCount: userIds.length }, 'Checking for user migrations');
+    }
+    
     for (const userId of userIds) {
-      await migrateUserIdFromHash(client, userId);
+      await migrateUserIdFromHash(client, userId, log);
     }
     
     const insertQuery = `
@@ -131,12 +142,17 @@ export async function saveWordleResults(scores, channelId) {
     }
     
     await client.query('COMMIT');
-    console.log(`Saved ${insertCount} wordle results to database (${newCount} new, ${updatedCount} updated) for channel ${channelId}`);
+    
+    if (log) {
+      log.info({ total: insertCount, new: newCount, updated: updatedCount }, 'Saved wordle results to database');
+    }
     
     return { total: insertCount, new: newCount, updated: updatedCount };
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Error saving wordle results:', error);
+    if (log) {
+      log.error({ err: error }, 'Error saving wordle results');
+    }
     throw error;
   } finally {
     client.release();
@@ -148,7 +164,8 @@ export async function saveWordleResults(scores, channelId) {
 // NOTE: May contain duplicates (same userId + wordleNumber in different channels)
 // Use deduplicateScores() helper to remove duplicates with channel priority
 // channelId: optional filter by specific channel (null = all channels, '0' = legacy data)
-export async function getWordleResults(userIds = null, startNumber = null, endNumber = null, channelId = null) {
+export async function getWordleResults(userIds = null, startNumber = null, endNumber = null, channelId = null, logger) {
+  const log = logger ? logger.child({ function: 'getWordleResults', channelId }) : null;
   const client = await pool.connect();
   
   try {
@@ -218,12 +235,16 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
       });
     }
     
-    const channelInfo = channelId ? ` for channel ${channelId}` : '';
-    console.log(`Retrieved results for ${Object.keys(scores).length} wordle puzzles from database${channelInfo}`);
+    if (log) {
+      const channelInfo = channelId ? ` for channel ${channelId}` : '';
+      log.info({ puzzleCount: Object.keys(scores).length, channelInfo }, 'Retrieved wordle results from database');
+    }
     
     return scores;
   } catch (error) {
-    console.error('Error retrieving wordle results:', error);
+    if (log) {
+      log.error({ err: error }, 'Error retrieving wordle results');
+    }
     throw error;
   } finally {
     client.release();
@@ -232,7 +253,8 @@ export async function getWordleResults(userIds = null, startNumber = null, endNu
 
 // Get all unique user IDs in the database (both plain and hashed)
 // channelId: optional filter by specific channel
-export async function getAllUserIds(channelId = null) {
+export async function getAllUserIds(channelId = null, logger) {
+  const log = logger ? logger.child({ function: 'getAllUserIds', channelId }) : null;
   const client = await pool.connect();
   
   try {
@@ -246,9 +268,15 @@ export async function getAllUserIds(channelId = null) {
     
     const result = await client.query(query, params);
     
+    if (log) {
+      log.debug({ userCount: result.rows.length }, 'Retrieved user IDs');
+    }
+    
     return result.rows.map(row => row.user_id_hash);
   } catch (error) {
-    console.error('Error getting user IDs:', error);
+    if (log) {
+      log.error({ err: error }, 'Error getting user IDs');
+    }
     throw error;
   } finally {
     client.release();
@@ -258,12 +286,13 @@ export async function getAllUserIds(channelId = null) {
 // Get detailed statistics for a specific user
 // Deduplicates by (user_id, wordle_number) using channel priority
 // channelId: optional preferred channel for deduplication (null = use lowest non-zero, then 0)
-export async function getUserStats(userId, channelId = null) {
+export async function getUserStats(userId, channelId = null, logger) {
+  const log = logger ? logger.child({ function: 'getUserStats', userId, channelId }) : null;
   const client = await pool.connect();
   
   try {
     // First, try to migrate this user's data if it exists as hashed
-    await migrateUserIdFromHash(client, userId);
+    await migrateUserIdFromHash(client, userId, log);
     
     // Use DISTINCT ON to pick one row per wordle_number based on priority
     // Priority: 1) channelId (if provided), 2) lowest non-zero channel_id, 3) channel_id 0
@@ -323,6 +352,9 @@ export async function getUserStats(userId, channelId = null) {
     );
     
     if (deduplicatedGames.rows.length === 0) {
+      if (log) {
+        log.info('No games found for user');
+      }
       // No games found
       return {
         totalGames: 0,
@@ -366,6 +398,10 @@ export async function getUserStats(userId, channelId = null) {
         messageId: r.message_id
       }));
     
+    if (log) {
+      log.info({ totalGames, avgScore: parseFloat(avgScore.toFixed(2)), bestScore, worstScore }, 'Retrieved user stats');
+    }
+    
     return {
       totalGames,
       avgScore: parseFloat(avgScore.toFixed(2)),
@@ -377,7 +413,9 @@ export async function getUserStats(userId, channelId = null) {
       recent
     };
   } catch (error) {
-    console.error('Error getting user stats:', error);
+    if (log) {
+      log.error({ err: error }, 'Error getting user stats');
+    }
     throw error;
   } finally {
     client.release();
@@ -386,7 +424,8 @@ export async function getUserStats(userId, channelId = null) {
 
 // Get all results from a specific message ID
 // Returns array of all rows with that message_id (can be multiple users)
-export async function getResultsByMessageId(messageId) {
+export async function getResultsByMessageId(messageId, logger) {
+  const log = logger ? logger.child({ function: 'getResultsByMessageId', messageId }) : null;
   const client = await pool.connect();
   
   try {
@@ -400,9 +439,15 @@ export async function getResultsByMessageId(messageId) {
       [messageId.toString()]
     );
     
+    if (log) {
+      log.debug({ resultCount: result.rows.length }, 'Retrieved results by message ID');
+    }
+    
     return result.rows; // Returns array (can be empty, or have multiple rows)
   } catch (error) {
-    console.error('Error getting results by message ID:', error);
+    if (log) {
+      log.error({ err: error }, 'Error getting results by message ID');
+    }
     throw error;
   } finally {
     client.release();

@@ -133,7 +133,7 @@ export function calcEloIterated(scores, allPlayers, k = 2, maxScore = 6) {
   return eloOverTime;
 }
 
-async function handleRateLimitHeaders(response, context = '') {
+async function handleRateLimitHeaders(response, context = '', logger) {
   const remaining = response.headers.get('x-ratelimit-remaining');
   const resetAfter = response.headers.get('x-ratelimit-reset-after');
   const limit = response.headers.get('x-ratelimit-limit');
@@ -145,14 +145,16 @@ async function handleRateLimitHeaders(response, context = '') {
     // If we're running low on requests, add a delay
     if (remainingCount <= 2 && remainingCount > 0) {
       const waitTime = resetAfter ? parseFloat(resetAfter) * 1000 : 1000;
-      console.log(`[RateLimit] ${context}: ${remainingCount}/${limitCount} remaining, waiting ${waitTime}ms`);
+      if (logger) {
+        logger.debug({ context, remaining: remainingCount, limit: limitCount, waitTime }, 'Rate limit approaching, adding delay');
+      }
       await new Promise(resolve => setTimeout(resolve, waitTime));
     }
   }
 }
 
 // Fetch a single batch of messages from Discord
-async function fetchMessageBatch(channelId, before) {
+async function fetchMessageBatch(channelId, before, logger) {
   const url = `https://discord.com/api/v10/channels/${channelId}/messages?limit=100${before ? `&before=${before}` : ''}`;
   
   let retries = 0;
@@ -169,7 +171,9 @@ async function fetchMessageBatch(channelId, before) {
     if (response.status === 429) {
       const retryAfter = response.headers.get('retry-after');
       const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : Math.pow(2, retries) * 1000;
-      console.log(`Rate limited. Waiting ${waitTime}ms before retry ${retries + 1}/${maxRetries}`);
+      if (logger) {
+        logger.warn({ retries: retries + 1, maxRetries, waitTime }, 'Rate limited, waiting before retry');
+      }
       await new Promise(resolve => setTimeout(resolve, waitTime));
       retries++;
       continue;
@@ -179,7 +183,7 @@ async function fetchMessageBatch(channelId, before) {
       throw new Error(`Failed to fetch messages: ${response.status} ${response.statusText}`);
     }
 
-    await handleRateLimitHeaders(response, 'fetchMessageBatch');
+    await handleRateLimitHeaders(response, 'fetchMessageBatch', logger);
     return await response.json();
   }
   
@@ -187,7 +191,7 @@ async function fetchMessageBatch(channelId, before) {
 }
 
 // Function to fetch user info from Discord API
-export async function fetchUserInfo(userId) {
+export async function fetchUserInfo(userId, logger) {
   try {
     let retries = 0;
     const maxRetries = 3;
@@ -206,7 +210,9 @@ export async function fetchUserInfo(userId) {
         const retryAfter = response.headers.get('retry-after');
         const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : Math.pow(2, retries) * 1000;
         
-        console.log(`Rate limited fetching user ${userId}. Waiting ${waitTime}ms`);
+        if (logger) {
+          logger.warn({ userId, waitTime }, 'Rate limited fetching user, waiting');
+        }
         await new Promise(resolve => setTimeout(resolve, waitTime));
         retries++;
         continue;
@@ -216,18 +222,22 @@ export async function fetchUserInfo(userId) {
     }
     
     if (!response.ok) {
-      console.warn(`Failed to fetch user ${userId}: ${response.status}`);
+      if (logger) {
+        logger.warn({ userId, status: response.status }, 'Failed to fetch user');
+      }
       return `User${userId.substring(0, 6)}`;
     }
 
     // Check rate limit headers
-    await handleRateLimitHeaders(response, 'fetchUserInfo');
+    await handleRateLimitHeaders(response, 'fetchUserInfo', logger);
     
     const user = await response.json();
     // Prefer display name, fall back to username, then user ID
     return user.display_name || user.global_name || user.username || `User${userId.substring(0, 6)}`;
   } catch (error) {
-    console.error(`Failed to fetch user ${userId}:`, error);
+    if (logger) {
+      logger.error({ userId, err: error }, 'Failed to fetch user');
+    }
     return `User${userId.substring(0, 6)}`;
   }
 }
@@ -336,12 +346,14 @@ export function deduplicateScores(scores, preferredChannelId = null) {
 }
 
 // Build a mapping of nicknames to user IDs from guild members
-async function buildUsernameMapping(guildId) {
+async function buildUsernameMapping(guildId, logger) {
   const usernameToUserId = {};
   
   try {
     // Fetch all guild members with retry logic
-    console.log(`Fetching guild members for guild ${guildId}...`);
+    if (logger) {
+      logger.debug({ guildId }, 'Fetching guild members');
+    }
     
     let retries = 0;
     const maxRetries = 3;
@@ -359,7 +371,9 @@ async function buildUsernameMapping(guildId) {
         const retryAfter = response.headers.get('retry-after');
         const waitTime = retryAfter ? parseFloat(retryAfter) * 1000 : Math.pow(2, retries) * 1000;
         
-        console.log(`Rate limited fetching guild members. Waiting ${waitTime}ms`);
+        if (logger) {
+          logger.warn({ waitTime }, 'Rate limited fetching guild members, waiting');
+        }
         await new Promise(resolve => setTimeout(resolve, waitTime));
         retries++;
         continue;
@@ -369,12 +383,14 @@ async function buildUsernameMapping(guildId) {
     }
     
     if (!response.ok) {
-      console.error(`Failed to fetch guild members: ${response.status}`);
+      if (logger) {
+        logger.error({ status: response.status }, 'Failed to fetch guild members');
+      }
       return { usernameToUserId };
     }
 
     // Check rate limit headers
-    await handleRateLimitHeaders(response, 'buildUsernameMapping');
+    await handleRateLimitHeaders(response, 'buildUsernameMapping', logger);
     
     const members = await response.json();
     
@@ -389,13 +405,15 @@ async function buildUsernameMapping(guildId) {
       usernameToUserId[displayName.toLowerCase()] = userId;
     }
   } catch (error) {
-    console.error('Error building username mapping:', error);
+    if (logger) {
+      logger.error({ err: error }, 'Error building username mapping');
+    }
   }
   return { usernameToUserId };
 }
 
 // Extract Wordle number from image using OCR
-async function extractWordleNumber(imageUrl) {
+async function extractWordleNumber(imageUrl, logger) {
   let tempFile = null;
   
   try {
@@ -431,10 +449,14 @@ async function extractWordleNumber(imageUrl) {
       return parseInt(match[1]);
     }
     
-    console.warn(`  ✗ Could not extract Wordle number from image. Text found: ${text.substring(0, 100)}`);
+    if (logger) {
+      logger.warn({ text: text.substring(0, 100) }, 'Could not extract Wordle number from image');
+    }
     return null;
   } catch (error) {
-    console.error(`  ✗ Error extracting Wordle number:`, error.message);
+    if (logger) {
+      logger.error({ err: error }, 'Error extracting Wordle number');
+    }
     return null;
   } finally {
     // Clean up temp file
@@ -449,7 +471,7 @@ async function extractWordleNumber(imageUrl) {
 }
 
 // Parse a batch of messages for Wordle results
-async function parseWordleResultsBatch(messages, usernameToUserId) {
+async function parseWordleResultsBatch(messages, usernameToUserId, logger) {
   const scores = {};
   
   for (const message of messages) {
@@ -457,13 +479,17 @@ async function parseWordleResultsBatch(messages, usernameToUserId) {
       // Extract Wordle number from attached image
       const imageUrl = message.attachments?.[0]?.url;
       if (!imageUrl) {
-        console.warn('Message has results but no image attachment, skipping');
+        if (logger) {
+          logger.warn({ messageId: message.id }, 'Message has results but no image attachment, skipping');
+        }
         continue;
       }
       
-      const wordleNumber = await extractWordleNumber(imageUrl);
+      const wordleNumber = await extractWordleNumber(imageUrl, logger);
       if (!wordleNumber) {
-        console.warn('Could not extract Wordle number from image, skipping message');
+        if (logger) {
+          logger.warn({ messageId: message.id }, 'Could not extract Wordle number from image, skipping message');
+        }
         continue;
       }
       
@@ -505,8 +531,8 @@ async function parseWordleResultsBatch(messages, usernameToUserId) {
             const username = cleaned.split('<')[0].split('@')[0].trim().toLowerCase();
             userId = usernameToUserId[username];
             
-            if (!userId) {
-              console.warn(`Could not resolve username: @${cleaned.split('<')[0].split('@')[0].trim()}`);
+            if (!userId && logger) {
+              logger.debug({ username: cleaned.split('<')[0].split('@')[0].trim() }, 'Could not resolve username');
             }
           }
           
@@ -540,34 +566,45 @@ async function parseWordleResultsBatch(messages, usernameToUserId) {
 // - guildId: Guild ID for username mapping
 // - existingMessageIds: Set of message IDs already in DB (pass null/empty Set for no early termination)
 // - limit: Maximum messages to fetch
+// - logger: Logger instance for structured logging
 //
 // Returns: { wordleNumber: [{ userId, score, messageId }, ...] }
-export async function fetchAndParseMessages(channelId, guildId, existingMessageIds = null, limit = 1000) {
+export async function fetchAndParseMessages(channelId, guildId, existingMessageIds = null, limit = 1000, logger) {
+  const log = logger ? logger.child({ function: 'fetchAndParseMessages', channelId, guildId }) : null;
+  
   const allScores = {};
   let totalMessages = 0;
   let before = null;
   
   // Build username mapping once at the start
-  console.log('[FetchParse] Building username mapping...');
-  const { usernameToUserId } = await buildUsernameMapping(guildId);
+  if (log) {
+    log.debug('Building username mapping');
+  }
+  const { usernameToUserId } = await buildUsernameMapping(guildId, log);
   
   // Normalize existingMessageIds (could be null, undefined, or empty Set)
   const messageIdSet = existingMessageIds || new Set();
   const checkForEarlyTermination = messageIdSet.size > 0;
   
-  if (checkForEarlyTermination) {
-    console.log(`[FetchParse] Early termination enabled: ${messageIdSet.size} existing message IDs`);
-  } else {
-    console.log('[FetchParse] Early termination disabled: fetching all messages');
+  if (log) {
+    if (checkForEarlyTermination) {
+      log.debug({ existingMessageIdsCount: messageIdSet.size }, 'Early termination enabled');
+    } else {
+      log.debug('Early termination disabled: fetching all messages');
+    }
   }
   
   // Fetch first batch
-  console.log('[FetchParse] Fetching first batch...');
-  let currentBatch = await fetchMessageBatch(channelId, before);
+  if (log) {
+    log.debug('Fetching first batch');
+  }
+  let currentBatch = await fetchMessageBatch(channelId, before, log);
   
   while (currentBatch && currentBatch.length > 0 && totalMessages < limit) {
     totalMessages += currentBatch.length;
-    console.log(`[FetchParse] Processing batch of ${currentBatch.length} messages (total: ${totalMessages})`);
+    if (log) {
+      log.debug({ batchSize: currentBatch.length, totalMessages }, 'Processing batch');
+    }
     
     // Check if we hit any existing messages in this batch (only if early termination is enabled)
     let firstExistingIndex = -1;
@@ -575,17 +612,23 @@ export async function fetchAndParseMessages(channelId, guildId, existingMessageI
       firstExistingIndex = currentBatch.findIndex(msg => messageIdSet.has(msg.id));
       
       if (firstExistingIndex !== -1) {
-        console.log(`[FetchParse] Found existing message at index ${firstExistingIndex}, stopping fetch`);
+        if (log) {
+          log.info({ firstExistingIndex }, 'Found existing message, stopping fetch');
+        }
         // Only process messages before the first existing one
         const newMessages = currentBatch.slice(0, firstExistingIndex);
         
         if (newMessages.length > 0) {
-          console.log(`[FetchParse] Processing final ${newMessages.length} new messages...`);
-          const batchScores = await parseWordleResultsBatch(newMessages, usernameToUserId);
+          if (log) {
+            log.debug({ newMessagesCount: newMessages.length }, 'Processing final new messages');
+          }
+          const batchScores = await parseWordleResultsBatch(newMessages, usernameToUserId, log);
           Object.assign(allScores, batchScores);
         }
         
-        console.log('[FetchParse] Early termination - all older messages assumed in DB');
+        if (log) {
+          log.info('Early termination - all older messages assumed in DB');
+        }
         break; // Stop processing
       }
     }
@@ -601,12 +644,12 @@ export async function fetchAndParseMessages(channelId, guildId, existingMessageI
       nextBatchPromise = (async () => {
         // Small delay to be respectful to Discord API
         await new Promise(resolve => setTimeout(resolve, 500));
-        return await fetchMessageBatch(channelId, before);
+        return await fetchMessageBatch(channelId, before, log);
       })();
     }
     
     // Process current batch (OCR happens here) - runs in parallel with next fetch (including its delay)
-    const parsePromise = parseWordleResultsBatch(currentBatch, usernameToUserId);
+    const parsePromise = parseWordleResultsBatch(currentBatch, usernameToUserId, log);
     
     // Wait for both to complete (delay in fetch happens during OCR - efficient!)
     const [batchScores, nextBatch] = await Promise.all([
@@ -614,7 +657,9 @@ export async function fetchAndParseMessages(channelId, guildId, existingMessageI
       nextBatchPromise || Promise.resolve(null)
     ]);
     
-    console.log(`[FetchParse] Found ${Object.keys(batchScores).length} Wordle days in this batch`);
+    if (log) {
+      log.debug({ wordleDaysCount: Object.keys(batchScores).length }, 'Found Wordle days in batch');
+    }
     Object.assign(allScores, batchScores);
     
     // Move to next batch
@@ -622,17 +667,21 @@ export async function fetchAndParseMessages(channelId, guildId, existingMessageI
     
     // If we got a partial batch, we're done
     if (nextBatch && nextBatch.length < 100) {
-      console.log('[FetchParse] Received partial batch, no more messages available');
+      if (log) {
+        log.debug({ batchSize: nextBatch.length }, 'Received partial batch, no more messages available');
+      }
       
       // Process this final batch
-      const finalBatchScores = await parseWordleResultsBatch(nextBatch, usernameToUserId);
+      const finalBatchScores = await parseWordleResultsBatch(nextBatch, usernameToUserId, log);
       Object.assign(allScores, finalBatchScores);
       totalMessages += nextBatch.length;
       break;
     }
   }
   
-  console.log(`[FetchParse] Completed. Fetched ${totalMessages} messages, found ${Object.keys(allScores).length} Wordle days`);
+  if (log) {
+    log.info({ totalMessages, wordleDaysCount: Object.keys(allScores).length }, 'Fetch and parse completed');
+  }
   return allScores;
 }
 

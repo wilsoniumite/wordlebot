@@ -8,6 +8,12 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - PUBLIC_KEY=${PUBLIC_KEY}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-myuser}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-mydb}
+      - NODE_ENV=${NODE_ENV:-production}
+      - DATABASE_SSL=false
+      # OpenTelemetry config for SigNoz
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://signoz-otel-collector:4318
+      - OTEL_SERVICE_NAME=discord-wordle-bot
+      - OTEL_LOG_LEVEL=info
     ports:
       - "3000:3000"
     depends_on:
@@ -17,22 +23,7 @@ services:
       - ./scripts:/usr/src/bot/scripts
     networks:
       - bot-network
-
-  umami:
-    image: ghcr.io/umami-software/umami:postgresql-latest
-    container_name: umami
-    ports:
-      - "3001:3000"
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-myuser}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/umami
-      DATABASE_TYPE: postgresql
-      APP_SECRET: ${UMAMI_SECRET:-change-me-to-random-string}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - bot-network
+      - signoz-net
 
   postgres:
     image: postgres:16-alpine
@@ -41,7 +32,7 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-myuser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_DB:-mydb},umami
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_DB:-mydb}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -59,3 +50,5 @@ volumes:
 networks:
   bot-network:
     driver: bridge
+  signoz-net:
+    external: true
